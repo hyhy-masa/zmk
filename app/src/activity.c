@@ -30,6 +30,10 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zephyr/input/input.h>
 #endif
 
+#if IS_ENABLED(CONFIG_SETTINGS)
+#include <zephyr/settings/settings.h>
+#endif
+
 bool is_usb_power_present(void) {
 #if IS_ENABLED(CONFIG_USB_DEVICE_STACK)
     return zmk_usb_is_powered();
@@ -46,6 +50,38 @@ static uint32_t activity_last_uptime;
 
 #if IS_ENABLED(CONFIG_ZMK_SLEEP)
 #define MAX_SLEEP_MS CONFIG_ZMK_IDLE_SLEEP_TIMEOUT
+#else
+#define MAX_SLEEP_MS 0
+#endif
+
+struct activity_setting_state {
+    uint32_t sleep_ms;
+    uint32_t idle_ms;
+};
+
+struct activity_setting_state activity_settings = {
+    .sleep_ms = MAX_SLEEP_MS,
+    .idle_ms = MAX_IDLE_MS,
+};
+
+#if IS_ENABLED(CONFIG_SETTINGS)
+static int activity_settings_load_cb(const char *name, size_t len, settings_read_cb read_cb,
+                                     void *cb_arg) {
+    if (strcmp(name, "s") == 0 && len == sizeof(activity_settings)) {
+        int rc = read_cb(cb_arg, &activity_settings, sizeof(activity_settings));
+        return MIN(rc, 0);
+    }
+    return -ENOENT;
+}
+
+SETTINGS_STATIC_HANDLER_DEFINE(activity, "activity", NULL, activity_settings_load_cb, NULL, NULL);
+
+static void activity_settings_save_work_handler(struct k_work *work) {
+    settings_save_one("activity/s", &activity_settings, sizeof(activity_settings));
+}
+
+K_WORK_DELAYABLE_DEFINE(activity_settings_save_work, activity_settings_save_work_handler);
+
 #endif
 
 int raise_event(void) {
@@ -63,6 +99,29 @@ int set_state(enum zmk_activity_state state) {
 
 enum zmk_activity_state zmk_activity_get_state(void) { return activity_state; }
 
+uint32_t zmk_activity_get_sleep_ms(void) { return activity_settings.sleep_ms; }
+
+uint32_t zmk_activity_get_idle_ms(void) { return activity_settings.idle_ms; }
+
+bool zmk_activity_set_sleep_ms(uint32_t sleep_ms) {
+#if IS_ENABLED(CONFIG_ZMK_SLEEP)
+    activity_settings.sleep_ms = sleep_ms;
+    LOG_INF("Updated sleep timeout to %d ms", sleep_ms);
+    k_work_schedule(&activity_settings_save_work, K_MSEC(CONFIG_ZMK_SETTINGS_SAVE_DEBOUNCE));
+    return true;
+#else
+    LOG_WRN("Sleep functionality is not enabled");
+    return false;
+#endif
+}
+
+bool zmk_activity_set_idle_ms(uint32_t idle_ms) {
+    activity_settings.idle_ms = idle_ms;
+    LOG_INF("Updated idle timeout to %d ms", idle_ms);
+    k_work_schedule(&activity_settings_save_work, K_MSEC(CONFIG_ZMK_SETTINGS_SAVE_DEBOUNCE));
+    return true;
+}
+
 static int note_activity(void) {
     activity_last_uptime = k_uptime_get();
 
@@ -75,7 +134,8 @@ void activity_work_handler(struct k_work *work) {
     int32_t current = k_uptime_get();
     int32_t inactive_time = current - activity_last_uptime;
 #if IS_ENABLED(CONFIG_ZMK_SLEEP)
-    if (inactive_time > MAX_SLEEP_MS && !is_usb_power_present()) {
+    if (activity_settings.sleep_ms > 0 && inactive_time > activity_settings.sleep_ms &&
+        !is_usb_power_present()) {
         // Put devices in suspend power mode before sleeping
         set_state(ZMK_ACTIVITY_SLEEP);
 
@@ -88,7 +148,7 @@ void activity_work_handler(struct k_work *work) {
         sys_poweroff();
     } else
 #endif /* IS_ENABLED(CONFIG_ZMK_SLEEP) */
-        if (inactive_time > MAX_IDLE_MS) {
+        if (activity_settings.idle_ms > 0 && inactive_time > activity_settings.idle_ms) {
             set_state(ZMK_ACTIVITY_IDLE);
         }
 }

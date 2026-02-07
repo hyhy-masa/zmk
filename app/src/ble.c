@@ -194,7 +194,7 @@ int update_advertising(void) {
         // LOG_DBG("Directed advertising to %s", addr_str);
         // desired_adv = ZMK_ADV_DIR;
     } else if (directed_advertising_enabled) {
-        desired_adv = ZMK_ADV_DIR;
+        desired_adv = ZMK_ADV_CONN; // TODO: Change back to ZMK_ADV_DIR when fixed
     }
     LOG_DBG("advertising from %d to %d", advertising_status, desired_adv);
 

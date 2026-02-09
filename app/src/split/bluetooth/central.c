@@ -49,14 +49,17 @@ struct peripheral_slot {
     struct bt_conn *conn;
     struct bt_gatt_discover_params discover_params;
     struct bt_gatt_subscribe_params subscribe_params;
+    struct bt_gatt_discover_params sub_discover_params;
     struct bt_gatt_subscribe_params sensor_subscribe_params;
+    struct bt_gatt_discover_params sensor_sub_discover_params;
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_RELAY_EVENT)
     struct bt_gatt_subscribe_params relay_event_subscribe_params;
+    struct bt_gatt_discover_params relay_event_sub_discover_params;
 #endif
-    struct bt_gatt_discover_params sub_discover_params;
     uint16_t run_behavior_handle;
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING)
     struct bt_gatt_subscribe_params batt_lvl_subscribe_params;
+    struct bt_gatt_discover_params batt_lvl_sub_discover_params;
     struct bt_gatt_read_params batt_lvl_read_params;
 #endif /* IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING) */
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_PERIPHERAL_HID_INDICATORS)
@@ -711,7 +714,7 @@ static uint8_t split_central_chrc_discovery_func(struct bt_conn *conn,
             slot->discover_params.start_handle = attr->handle + 2;
             slot->discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
 
-            slot->sensor_subscribe_params.disc_params = &slot->sub_discover_params;
+            slot->sensor_subscribe_params.disc_params = &slot->sensor_sub_discover_params;
             slot->sensor_subscribe_params.end_handle = slot->discover_params.end_handle;
             slot->sensor_subscribe_params.value_handle = bt_gatt_attr_value_handle(attr);
             slot->sensor_subscribe_params.notify = split_central_sensor_notify_func;
@@ -726,7 +729,7 @@ static uint8_t split_central_chrc_discovery_func(struct bt_conn *conn,
             slot->discover_params.start_handle = attr->handle + 2;
             slot->discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
 
-            slot->relay_event_subscribe_params.disc_params = &slot->sub_discover_params;
+            slot->relay_event_subscribe_params.disc_params = &slot->relay_event_sub_discover_params;
             slot->relay_event_subscribe_params.end_handle = slot->discover_params.end_handle;
             slot->relay_event_subscribe_params.value_handle = bt_gatt_attr_value_handle(attr);
             slot->relay_event_subscribe_params.notify = split_central_relay_event_notify_func;
@@ -775,7 +778,7 @@ static uint8_t split_central_chrc_discovery_func(struct bt_conn *conn,
         } else if (!bt_uuid_cmp(((struct bt_gatt_chrc *)attr->user_data)->uuid,
                                 BT_UUID_BAS_BATTERY_LEVEL)) {
             LOG_DBG("Found battery level characteristics");
-            slot->batt_lvl_subscribe_params.disc_params = &slot->sub_discover_params;
+            slot->batt_lvl_subscribe_params.disc_params = &slot->batt_lvl_sub_discover_params;
             slot->batt_lvl_subscribe_params.end_handle = slot->discover_params.end_handle;
             slot->batt_lvl_subscribe_params.value_handle = bt_gatt_attr_value_handle(attr);
             slot->batt_lvl_subscribe_params.notify = split_central_battery_level_notify_func;

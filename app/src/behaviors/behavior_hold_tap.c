@@ -19,6 +19,10 @@
 #include <zmk/events/keycode_state_changed.h>
 #include <zmk/behavior.h>
 
+#if IS_ENABLED(CONFIG_ZMK_RUNTIME_HOLD_TAP)
+#include <zmk/runtime_hold_tap.h>
+#endif
+
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 #if DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT)
@@ -71,6 +75,9 @@ struct behavior_hold_tap_data {
 #if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_METADATA)
     struct behavior_parameter_metadata_set set;
 #endif // IS_ENABLED(CONFIG_ZMK_BEHAVIOR_METADATA)
+#if IS_ENABLED(CONFIG_ZMK_RUNTIME_HOLD_TAP)
+    uint8_t ht_instance_id;
+#endif
 };
 
 // this data is specific for each hold-tap
@@ -78,6 +85,9 @@ struct active_hold_tap {
     int32_t position;
 #if IS_ENABLED(CONFIG_ZMK_SPLIT)
     uint8_t source;
+#endif
+#if IS_ENABLED(CONFIG_ZMK_RUNTIME_HOLD_TAP)
+    uint8_t ht_instance_id;
 #endif
     uint32_t param_hold;
     uint32_t param_tap;
@@ -141,12 +151,43 @@ static void store_last_hold_tapped(struct active_hold_tap *hold_tap) {
     last_tapped.timestamp = hold_tap->timestamp;
 }
 
+#if IS_ENABLED(CONFIG_ZMK_RUNTIME_HOLD_TAP)
+static inline int ht_tapping_term_ms(struct active_hold_tap *hold_tap) {
+    int override = zmk_runtime_hold_tap_get_tapping_term(hold_tap->ht_instance_id);
+    if (override > 0) return override;
+    return hold_tap->config->tapping_term_ms;
+}
+
+static inline int ht_quick_tap_ms(struct active_hold_tap *hold_tap) {
+    int override = zmk_runtime_hold_tap_get_quick_tap(hold_tap->ht_instance_id);
+    if (override >= 0) return override;
+    return hold_tap->config->quick_tap_ms;
+}
+
+static inline int ht_require_prior_idle_ms(struct active_hold_tap *hold_tap) {
+    int override = zmk_runtime_hold_tap_get_require_prior_idle(hold_tap->ht_instance_id);
+    if (override >= 0) return override;
+    return hold_tap->config->require_prior_idle_ms;
+}
+
+static inline int ht_flavor(struct active_hold_tap *hold_tap) {
+    int override = zmk_runtime_hold_tap_get_flavor(hold_tap->ht_instance_id);
+    if (override >= 0) return override;
+    return hold_tap->config->flavor;
+}
+#else
+#define ht_tapping_term_ms(ht) ((ht)->config->tapping_term_ms)
+#define ht_quick_tap_ms(ht) ((ht)->config->quick_tap_ms)
+#define ht_require_prior_idle_ms(ht) ((ht)->config->require_prior_idle_ms)
+#define ht_flavor(ht) ((ht)->config->flavor)
+#endif
+
 static bool is_quick_tap(struct active_hold_tap *hold_tap) {
-    if ((last_tapped.timestamp + hold_tap->config->require_prior_idle_ms) > hold_tap->timestamp) {
+    if ((last_tapped.timestamp + ht_require_prior_idle_ms(hold_tap)) > hold_tap->timestamp) {
         return true;
     } else {
         return (last_tapped.position == hold_tap->position) &&
-               (last_tapped.timestamp + hold_tap->config->quick_tap_ms) > hold_tap->timestamp;
+               (last_tapped.timestamp + ht_quick_tap_ms(hold_tap)) > hold_tap->timestamp;
     }
 }
 
@@ -543,7 +584,7 @@ static void decide_hold_tap(struct active_hold_tap *hold_tap,
     }
 
     // If the hold-tap behavior is still undecided, attempt to decide it.
-    switch (hold_tap->config->flavor) {
+    switch (ht_flavor(hold_tap)) {
     case FLAVOR_HOLD_PREFERRED:
         decide_hold_preferred(hold_tap, decision_moment);
         break;
@@ -567,7 +608,7 @@ static void decide_hold_tap(struct active_hold_tap *hold_tap,
     // Since the hold-tap has been decided, clean up undecided_hold_tap and
     // execute the decided behavior.
     LOG_DBG("%d decided %s (%s decision moment %s)", hold_tap->position,
-            status_str(hold_tap->status), flavor_str(hold_tap->config->flavor),
+            status_str(hold_tap->status), flavor_str(ht_flavor(hold_tap)),
             decision_moment_str(decision_moment));
     undecided_hold_tap = NULL;
     press_binding(hold_tap);
@@ -616,6 +657,12 @@ static int on_hold_tap_binding_pressed(struct zmk_behavior_binding *binding,
 
     struct active_hold_tap *hold_tap =
         store_hold_tap(&event, binding->param1, binding->param2, cfg);
+#if IS_ENABLED(CONFIG_ZMK_RUNTIME_HOLD_TAP)
+    if (hold_tap != NULL) {
+        struct behavior_hold_tap_data *data = dev->data;
+        hold_tap->ht_instance_id = data->ht_instance_id;
+    }
+#endif
 
     if (hold_tap == NULL) {
         LOG_ERR("unable to store hold-tap info, did you press more than %d hold-taps?",
@@ -634,7 +681,8 @@ static int on_hold_tap_binding_pressed(struct zmk_behavior_binding *binding,
 
     // if this behavior was queued we have to adjust the timer to only
     // wait for the remaining time.
-    int32_t tapping_term_ms_left = (hold_tap->timestamp + cfg->tapping_term_ms) - k_uptime_get();
+    int32_t tapping_term_ms_left =
+        (hold_tap->timestamp + ht_tapping_term_ms(hold_tap)) - k_uptime_get();
     k_work_schedule(&hold_tap->work, K_MSEC(tapping_term_ms_left));
 
     return ZMK_BEHAVIOR_OPAQUE;
@@ -651,7 +699,7 @@ static int on_hold_tap_binding_released(struct zmk_behavior_binding *binding,
     // If these events were queued, the timer event may be queued too late or not at all.
     // We insert a timer event before the TH_KEY_UP event to verify.
     int work_cancel_result = k_work_cancel_delayable(&hold_tap->work);
-    if (event.timestamp > (hold_tap->timestamp + hold_tap->config->tapping_term_ms)) {
+    if (event.timestamp > (hold_tap->timestamp + ht_tapping_term_ms(hold_tap))) {
         decide_hold_tap(hold_tap, HT_TIMER_EVENT);
     }
 
@@ -758,7 +806,7 @@ static int position_state_changed_listener(const zmk_event_t *eh) {
     // We make a timer decision before the other key events are handled if the timer would
     // have run out.
     if (ev->timestamp >
-        (undecided_hold_tap->timestamp + undecided_hold_tap->config->tapping_term_ms)) {
+        (undecided_hold_tap->timestamp + ht_tapping_term_ms(undecided_hold_tap))) {
         decide_hold_tap(undecided_hold_tap, HT_TIMER_EVENT);
     }
 
@@ -874,7 +922,9 @@ static int behavior_hold_tap_init(const struct device *dev) {
         .hold_trigger_key_positions = DT_INST_PROP(n, hold_trigger_key_positions),                 \
         .hold_trigger_key_positions_len = DT_INST_PROP_LEN(n, hold_trigger_key_positions),         \
     };                                                                                             \
-    static struct behavior_hold_tap_data behavior_hold_tap_data_##n = {};                          \
+    static struct behavior_hold_tap_data behavior_hold_tap_data_##n = {                             \
+        IF_ENABLED(CONFIG_ZMK_RUNTIME_HOLD_TAP, (.ht_instance_id = n,))                            \
+    };                                                                                             \
     BEHAVIOR_DT_INST_DEFINE(n, behavior_hold_tap_init, NULL, &behavior_hold_tap_data_##n,          \
                             &behavior_hold_tap_config_##n, POST_KERNEL,                            \
                             CONFIG_KERNEL_INIT_PRIORITY_DEFAULT, &behavior_hold_tap_driver_api);

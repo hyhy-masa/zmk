@@ -130,6 +130,11 @@ config ZMK_BEHAVIOR_STUDIO_UNLOCK
     default y
     depends on DT_HAS_ZMK_BEHAVIOR_STUDIO_UNLOCK_ENABLED && ZMK_STUDIO
 
+config ZMK_BEHAVIOR_DATA_LOGGER
+    bool
+    default y
+    depends on DT_HAS_ZMK_BEHAVIOR_DATA_LOGGER_ENABLED
+
 config ZMK_BEHAVIOR_MACRO
     bool
     default y

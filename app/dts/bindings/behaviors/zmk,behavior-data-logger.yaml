@@ -1,0 +1,8 @@
+# Copyright (c) 2026 The minimal-keys Contributors
+# SPDX-License-Identifier: MIT
+
+description: Data Logger Control Behavior
+
+compatible: "zmk,behavior-data-logger"
+
+include: one_param.yaml

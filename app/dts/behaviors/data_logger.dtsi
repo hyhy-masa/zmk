@@ -1,0 +1,15 @@
+/*
+ * Copyright (c) 2026 The minimal-keys Contributors
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
+/ {
+    behaviors {
+        dlog: data_logger {
+            compatible = "zmk,behavior-data-logger";
+            #binding-cells = <1>;
+            display-name = "Data Logger";
+        };
+    };
+};

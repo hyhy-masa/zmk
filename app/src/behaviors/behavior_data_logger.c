@@ -25,6 +25,7 @@ extern void pmw3610_dlog_set_marker(uint8_t marker_id) __attribute__((weak));
 
 /* BLE dump trigger lives in the data-logger BLE service (added next). */
 extern void pmw3610_dlog_request_dump(void) __attribute__((weak));
+extern void pmw3610_dlog_dump_uart(void) __attribute__((weak));
 
 static int on_keymap_binding_pressed(struct zmk_behavior_binding *binding,
                                      struct zmk_behavior_binding_event event) {
@@ -38,10 +39,10 @@ static int on_keymap_binding_pressed(struct zmk_behavior_binding *binding,
         LOG_INF("dlog: freeze");
         break;
     case DLOG_DUMP:
-        if (pmw3610_dlog_request_dump) {
-            pmw3610_dlog_request_dump();
+        if (pmw3610_dlog_dump_uart) {
+            pmw3610_dlog_dump_uart();
         }
-        LOG_INF("dlog: dump requested");
+        LOG_INF("dlog: dump via uart");
         break;
     case DLOG_CLEAR:
         if (pmw3610_dlog_clear) {

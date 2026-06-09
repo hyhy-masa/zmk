@@ -32,6 +32,7 @@
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 #include <zmk/ble.h>
+#include <zmk/hog.h>
 #include <zmk/keys.h>
 #include <zmk/split/bluetooth/uuid.h>
 #include <zmk/event_manager.h>
@@ -299,6 +300,11 @@ int zmk_ble_prof_select(uint8_t index) {
     }
 
     active_profile = index;
+
+#if IS_ENABLED(CONFIG_ZMK_POINTING)
+    zmk_hog_clear_mouse_queue();
+#endif
+
     ble_save_profile();
 
     update_advertising();
@@ -580,7 +586,7 @@ static void le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_t l
 
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
-    LOG_DBG("%s: interval %d latency %d timeout %d", addr, interval, latency, timeout);
+    LOG_INF("BLE params updated %s: interval %d latency %d timeout %d", addr, interval, latency, timeout);
 }
 
 static struct bt_conn_cb conn_callbacks = {

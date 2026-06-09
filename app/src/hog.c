@@ -440,6 +440,10 @@ void send_mouse_report_callback(struct k_work *work) {
 
 K_WORK_DEFINE(hog_mouse_work, send_mouse_report_callback);
 
+void zmk_hog_clear_mouse_queue(void) {
+    k_msgq_purge(&zmk_hog_mouse_msgq);
+}
+
 int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
     int err = k_msgq_put(&zmk_hog_mouse_msgq, report, K_MSEC(100));
     if (err) {

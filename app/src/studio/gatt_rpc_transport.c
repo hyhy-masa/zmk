@@ -94,10 +94,18 @@ BT_GATT_SERVICE_DEFINE(
     BT_GATT_CCC(rpc_ccc_cfg_changed, BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT));
 
 static uint16_t get_notify_size_for_conn(struct bt_conn *conn) {
-    uint16_t notify_size = 23; // Default MTU size unless negotiated higher
-    struct bt_conn_info conn_info;
-    if (conn && bt_conn_get_info(conn, &conn_info) >= 0) {
-        notify_size = conn_info.le.data_len->tx_max_len;
+    // A GATT notification/indication can carry at most (ATT_MTU - 3) bytes of
+    // payload. The previous code used the link-layer PDU size (data_len
+    // tx_max_len), which is a *different* layer: when the negotiated ATT MTU is
+    // smaller than the LL data length (common with macOS hosts), each chunk was
+    // sliced larger than a single indication can send, so responses were
+    // truncated on the wire and the host decoded garbage ("invalid wire type").
+    uint16_t notify_size = 20; // ATT_MTU 23 - 3 header, until negotiated higher
+    if (conn) {
+        uint16_t mtu = bt_gatt_get_mtu(conn);
+        if (mtu > 3) {
+            notify_size = mtu - 3;
+        }
     }
 
     return notify_size;
@@ -157,16 +165,28 @@ static void notif_rpc_tx_cb(struct k_work *work) {
         rpc_indicate_params.data = notify_bytes;
         rpc_indicate_params.len = added;
 
+        bool sent = false;
         int notify_attempts = 5;
         do {
             int err = bt_gatt_indicate(conn, &rpc_indicate_params);
             if (err >= 0) {
+                sent = true;
                 break;
             }
 
             LOG_WRN("Failed to notify the response %d", err);
             k_sleep(K_MSEC(200));
         } while (notify_attempts-- > 0);
+
+        if (!sent) {
+            // This chunk was already consumed from the ring but cannot be
+            // delivered. Skipping it would stream a corrupted frame to the host
+            // (decoded as "invalid wire type"). Drop the rest of the response
+            // instead so the host times out and retries cleanly.
+            LOG_ERR("RPC indicate failed after retries; aborting response");
+            ring_buf_reset(tx_buf);
+            break;
+        }
     }
 
     bt_conn_unref(conn);
@@ -194,7 +214,9 @@ static void gatt_tx_notify(struct ring_buf *tx_buf, size_t added, bool msg_done,
 static struct gatt_write_state tx_state = {};
 
 static void *gatt_tx_user_data(void) {
-    memset(&tx_state, sizeof(tx_state), 0);
+    // Args were previously (ptr, size, 0) => a zero-length memset that left the
+    // state uninitialized. memset is (ptr, value, length).
+    memset(&tx_state, 0, sizeof(tx_state));
 
     return &tx_state;
 }

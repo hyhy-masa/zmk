@@ -18,6 +18,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/endpoints_types.h>
 #include <zmk/hog.h>
 #include <zmk/hid.h>
+#include <zmk/mk2_ble_diag.h>
 #if IS_ENABLED(CONFIG_ZMK_POINTING_SMOOTH_SCROLLING)
 #include <zmk/pointing/resolution_multipliers.h>
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING_SMOOTH_SCROLLING)
@@ -328,6 +329,7 @@ void send_keyboard_report_callback(struct k_work *work) {
         } else if (err) {
             LOG_DBG("Error notifying %d", err);
         }
+        mk2_ble_diag_note_notify(MK2_BLE_DIAG_PIPE_KEYBOARD, err);
 
         bt_conn_unref(conn);
     }
@@ -380,6 +382,7 @@ void send_consumer_report_callback(struct k_work *work) {
         } else if (err) {
             LOG_DBG("Error notifying %d", err);
         }
+        mk2_ble_diag_note_notify(MK2_BLE_DIAG_PIPE_CONSUMER, err);
 
         bt_conn_unref(conn);
     }
@@ -433,6 +436,7 @@ void send_mouse_report_callback(struct k_work *work) {
         } else if (err) {
             LOG_DBG("Error notifying %d", err);
         }
+        mk2_ble_diag_note_notify(MK2_BLE_DIAG_PIPE_MOUSE, err);
 
         bt_conn_unref(conn);
     }

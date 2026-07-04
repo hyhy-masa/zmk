@@ -209,6 +209,17 @@ config ZMK_BLE_MOUSE_REPORT_QUEUE_SIZE
     int "Max number of mouse HID reports to queue for sending over BLE"
     default 20
 
+config MK2_BLE_DIAG
+    bool "MK2: BLE HID diagnostics (notify-failure counters + conn interval capture)"
+    default n
+    help
+      Phase 0 instrumentation for the BLE-only mouse-lag / cursor-jump /
+      stuck-key investigation. Counts bt_gatt_notify_cb() outcomes per HID pipe
+      and caches the active peripheral connection interval so USB-unplugged
+      sessions can be analyzed from the trackball data-logger dump. Adds no GATT
+      characteristics and changes no connection behavior (no settings_reset
+      required). Leave off for release builds.
+
 config ZMK_BLE_CLEAR_BONDS_ON_START
     bool "Configuration that clears all bond information from the keyboard on startup."
 

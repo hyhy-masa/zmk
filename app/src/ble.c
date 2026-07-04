@@ -33,6 +33,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 #include <zmk/ble.h>
 #include <zmk/hog.h>
+#include <zmk/mk2_ble_diag.h>
 #include <zmk/keys.h>
 #include <zmk/split/bluetooth/uuid.h>
 #include <zmk/event_manager.h>
@@ -512,6 +513,80 @@ static bool is_conn_active_profile(const struct bt_conn *conn) {
     return bt_addr_le_cmp(bt_conn_get_dst(conn), &profiles[active_profile].peer) == 0;
 }
 
+#if IS_ENABLED(CONFIG_MK2_BLE_DIAG)
+
+#include <string.h>
+#include <zephyr/sys/atomic.h>
+
+/* Notify failure buckets per pipe [pipe][0..4] = eperm,enomem,eagain,enotconn,other.
+ * Written only from the HOG send work thread; read (torn read tolerated) at dump. */
+static uint32_t mk2_diag_notify_ok[3];
+static uint32_t mk2_diag_notify_fail[3][5];
+static int mk2_diag_last_err[3];
+/* Connection params written from the BT callback context, read elsewhere. */
+static atomic_t mk2_diag_interval = ATOMIC_INIT(0);
+static atomic_t mk2_diag_latency = ATOMIC_INIT(0);
+static atomic_t mk2_diag_timeout = ATOMIC_INIT(0);
+
+static int mk2_diag_err_bucket(int err) {
+    switch (err) {
+    case -EPERM:
+        return 0;
+    case -ENOMEM:
+        return 1;
+    case -EAGAIN:
+        return 2;
+    case -ENOTCONN:
+        return 3;
+    default:
+        return 4;
+    }
+}
+
+void mk2_ble_diag_note_notify(uint8_t pipe, int err) {
+    if (pipe > MK2_BLE_DIAG_PIPE_MOUSE) {
+        return;
+    }
+    if (err == 0) {
+        mk2_diag_notify_ok[pipe]++;
+        return;
+    }
+    mk2_diag_notify_fail[pipe][mk2_diag_err_bucket(err)]++;
+    mk2_diag_last_err[pipe] = err;
+}
+
+void mk2_ble_diag_set_conn_params(uint16_t interval, uint16_t latency, uint16_t timeout) {
+    atomic_set(&mk2_diag_interval, interval);
+    atomic_set(&mk2_diag_latency, latency);
+    atomic_set(&mk2_diag_timeout, timeout);
+}
+
+uint16_t mk2_ble_diag_interval_units(void) {
+    return (uint16_t)atomic_get(&mk2_diag_interval);
+}
+
+void mk2_ble_diag_reset(void) {
+    memset(mk2_diag_notify_ok, 0, sizeof(mk2_diag_notify_ok));
+    memset(mk2_diag_notify_fail, 0, sizeof(mk2_diag_notify_fail));
+    memset(mk2_diag_last_err, 0, sizeof(mk2_diag_last_err));
+}
+
+void mk2_ble_diag_dump(void) {
+    static const char *const pipe_name[3] = {"kbd", "consumer", "mouse"};
+    printk("[MK2_DIAG]\n");
+    printk("pipe,ok,eperm,enomem,eagain,enotconn,other,last_err\n");
+    for (int p = 0; p < 3; p++) {
+        printk("%s,%u,%u,%u,%u,%u,%u,%d\n", pipe_name[p], mk2_diag_notify_ok[p],
+               mk2_diag_notify_fail[p][0], mk2_diag_notify_fail[p][1], mk2_diag_notify_fail[p][2],
+               mk2_diag_notify_fail[p][3], mk2_diag_notify_fail[p][4], mk2_diag_last_err[p]);
+    }
+    printk("conn_interval_units=%u,latency=%u,timeout=%u\n",
+           (uint16_t)atomic_get(&mk2_diag_interval), (uint16_t)atomic_get(&mk2_diag_latency),
+           (uint16_t)atomic_get(&mk2_diag_timeout));
+}
+
+#endif /* CONFIG_MK2_BLE_DIAG */
+
 static void connected(struct bt_conn *conn, uint8_t err) {
     char addr[BT_ADDR_LE_STR_LEN];
     struct bt_conn_info info;
@@ -539,6 +614,7 @@ static void connected(struct bt_conn *conn, uint8_t err) {
 
     if (is_conn_active_profile(conn)) {
         LOG_DBG("Active profile connected");
+        mk2_ble_diag_set_conn_params(info.le.interval, info.le.latency, info.le.timeout);
         k_work_submit(&raise_profile_changed_event_work);
     }
 }
@@ -564,6 +640,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
 
     if (is_conn_active_profile(conn)) {
         LOG_DBG("Active profile disconnected");
+        mk2_ble_diag_set_conn_params(0, 0, 0);
         k_work_submit(&raise_profile_changed_event_work);
     }
 }
@@ -587,6 +664,12 @@ static void le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_t l
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
     LOG_INF("BLE params updated %s: interval %d latency %d timeout %d", addr, interval, latency, timeout);
+
+#if IS_ENABLED(CONFIG_MK2_BLE_DIAG)
+    if (is_conn_active_profile(conn)) {
+        mk2_ble_diag_set_conn_params(interval, latency, timeout);
+    }
+#endif
 }
 
 static struct bt_conn_cb conn_callbacks = {

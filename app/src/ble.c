@@ -523,6 +523,17 @@ static bool is_conn_active_profile(const struct bt_conn *conn) {
 static uint32_t mk2_diag_notify_ok[3];
 static uint32_t mk2_diag_notify_fail[3][5];
 static int mk2_diag_last_err[3];
+/* Cursor-lag instrumentation. block_hist[pipe][0..5] = bt_gatt_notify_cb() block
+ * time <1,<5,<15,<50,<150,>=150 ms (the K_FOREVER PDU-alloc stall under TX
+ * congestion); block_max_us = worst block seen; queue_hwm = send-queue high-water
+ * mark; drop = queue-full oldest-eviction count (a delta loss invisible to the
+ * notify counters). block_* are written from the HOG work thread; queue_hwm/drop
+ * from the input-enqueue thread and are MOUSE-pipe only (kbd/consumer q_hwm/drops
+ * stay 0 = unmeasured). Each counter is single-writer; torn read at dump tolerated. */
+static uint32_t mk2_diag_block_hist[3][6];
+static uint32_t mk2_diag_block_max_us[3];
+static uint32_t mk2_diag_queue_hwm[3];
+static uint32_t mk2_diag_drop[3];
 /* Connection params written from the BT callback context, read elsewhere. */
 static atomic_t mk2_diag_interval = ATOMIC_INIT(0);
 static atomic_t mk2_diag_latency = ATOMIC_INIT(0);
@@ -555,6 +566,47 @@ void mk2_ble_diag_note_notify(uint8_t pipe, int err) {
     mk2_diag_last_err[pipe] = err;
 }
 
+static int mk2_diag_block_bucket(uint32_t us) {
+    if (us < 1000) {
+        return 0;
+    } else if (us < 5000) {
+        return 1;
+    } else if (us < 15000) {
+        return 2;
+    } else if (us < 50000) {
+        return 3;
+    } else if (us < 150000) {
+        return 4;
+    }
+    return 5;
+}
+
+void mk2_ble_diag_note_block(uint8_t pipe, uint32_t block_us) {
+    if (pipe > MK2_BLE_DIAG_PIPE_MOUSE) {
+        return;
+    }
+    mk2_diag_block_hist[pipe][mk2_diag_block_bucket(block_us)]++;
+    if (block_us > mk2_diag_block_max_us[pipe]) {
+        mk2_diag_block_max_us[pipe] = block_us;
+    }
+}
+
+void mk2_ble_diag_note_queue(uint8_t pipe, uint32_t used) {
+    if (pipe > MK2_BLE_DIAG_PIPE_MOUSE) {
+        return;
+    }
+    if (used > mk2_diag_queue_hwm[pipe]) {
+        mk2_diag_queue_hwm[pipe] = used;
+    }
+}
+
+void mk2_ble_diag_note_drop(uint8_t pipe) {
+    if (pipe > MK2_BLE_DIAG_PIPE_MOUSE) {
+        return;
+    }
+    mk2_diag_drop[pipe]++;
+}
+
 void mk2_ble_diag_set_conn_params(uint16_t interval, uint16_t latency, uint16_t timeout) {
     atomic_set(&mk2_diag_interval, interval);
     atomic_set(&mk2_diag_latency, latency);
@@ -569,6 +621,10 @@ void mk2_ble_diag_reset(void) {
     memset(mk2_diag_notify_ok, 0, sizeof(mk2_diag_notify_ok));
     memset(mk2_diag_notify_fail, 0, sizeof(mk2_diag_notify_fail));
     memset(mk2_diag_last_err, 0, sizeof(mk2_diag_last_err));
+    memset(mk2_diag_block_hist, 0, sizeof(mk2_diag_block_hist));
+    memset(mk2_diag_block_max_us, 0, sizeof(mk2_diag_block_max_us));
+    memset(mk2_diag_queue_hwm, 0, sizeof(mk2_diag_queue_hwm));
+    memset(mk2_diag_drop, 0, sizeof(mk2_diag_drop));
 }
 
 void mk2_ble_diag_dump(void) {
@@ -579,6 +635,13 @@ void mk2_ble_diag_dump(void) {
         printk("%s,%u,%u,%u,%u,%u,%u,%d\n", pipe_name[p], mk2_diag_notify_ok[p],
                mk2_diag_notify_fail[p][0], mk2_diag_notify_fail[p][1], mk2_diag_notify_fail[p][2],
                mk2_diag_notify_fail[p][3], mk2_diag_notify_fail[p][4], mk2_diag_last_err[p]);
+    }
+    printk("pipe,blk_lt1,blk_lt5,blk_lt15,blk_lt50,blk_lt150,blk_ge150,blk_max_us,q_hwm,drops\n");
+    for (int p = 0; p < 3; p++) {
+        printk("%s,%u,%u,%u,%u,%u,%u,%u,%u,%u\n", pipe_name[p], mk2_diag_block_hist[p][0],
+               mk2_diag_block_hist[p][1], mk2_diag_block_hist[p][2], mk2_diag_block_hist[p][3],
+               mk2_diag_block_hist[p][4], mk2_diag_block_hist[p][5], mk2_diag_block_max_us[p],
+               mk2_diag_queue_hwm[p], mk2_diag_drop[p]);
     }
     printk("conn_interval_units=%u,latency=%u,timeout=%u\n",
            (uint16_t)atomic_get(&mk2_diag_interval), (uint16_t)atomic_get(&mk2_diag_latency),

@@ -323,7 +323,14 @@ void send_keyboard_report_callback(struct k_work *work) {
             .len = sizeof(report),
         };
 
+#if IS_ENABLED(CONFIG_MK2_BLE_DIAG)
+        uint32_t mk2_notify_start = k_cycle_get_32();
+#endif
         int err = bt_gatt_notify_cb(conn, &notify_params);
+#if IS_ENABLED(CONFIG_MK2_BLE_DIAG)
+        mk2_ble_diag_note_block(MK2_BLE_DIAG_PIPE_KEYBOARD,
+                                k_cyc_to_us_floor32(k_cycle_get_32() - mk2_notify_start));
+#endif
         if (err == -EPERM) {
             bt_conn_set_security(conn, BT_SECURITY_L2);
         } else if (err) {
@@ -376,7 +383,14 @@ void send_consumer_report_callback(struct k_work *work) {
             .len = sizeof(report),
         };
 
+#if IS_ENABLED(CONFIG_MK2_BLE_DIAG)
+        uint32_t mk2_notify_start = k_cycle_get_32();
+#endif
         int err = bt_gatt_notify_cb(conn, &notify_params);
+#if IS_ENABLED(CONFIG_MK2_BLE_DIAG)
+        mk2_ble_diag_note_block(MK2_BLE_DIAG_PIPE_CONSUMER,
+                                k_cyc_to_us_floor32(k_cycle_get_32() - mk2_notify_start));
+#endif
         if (err == -EPERM) {
             bt_conn_set_security(conn, BT_SECURITY_L2);
         } else if (err) {
@@ -430,7 +444,14 @@ void send_mouse_report_callback(struct k_work *work) {
             .len = sizeof(report),
         };
 
+#if IS_ENABLED(CONFIG_MK2_BLE_DIAG)
+        uint32_t mk2_notify_start = k_cycle_get_32();
+#endif
         int err = bt_gatt_notify_cb(conn, &notify_params);
+#if IS_ENABLED(CONFIG_MK2_BLE_DIAG)
+        mk2_ble_diag_note_block(MK2_BLE_DIAG_PIPE_MOUSE,
+                                k_cyc_to_us_floor32(k_cycle_get_32() - mk2_notify_start));
+#endif
         if (err == -EPERM) {
             bt_conn_set_security(conn, BT_SECURITY_L2);
         } else if (err) {
@@ -453,9 +474,10 @@ int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
     if (err) {
         switch (err) {
         case -EAGAIN: {
-            LOG_WRN("Consumer message queue full, popping first message and queueing again");
+            LOG_WRN("Mouse message queue full, popping first message and queueing again");
             struct zmk_hid_mouse_report_body discarded_report;
             k_msgq_get(&zmk_hog_mouse_msgq, &discarded_report, K_NO_WAIT);
+            mk2_ble_diag_note_drop(MK2_BLE_DIAG_PIPE_MOUSE);
             return zmk_hog_send_mouse_report(report);
         }
         default:
@@ -464,6 +486,9 @@ int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
         }
     }
 
+#if IS_ENABLED(CONFIG_MK2_BLE_DIAG)
+    mk2_ble_diag_note_queue(MK2_BLE_DIAG_PIPE_MOUSE, k_msgq_num_used_get(&zmk_hog_mouse_msgq));
+#endif
     k_work_submit_to_queue(&hog_work_q, &hog_mouse_work);
 
     return 0;

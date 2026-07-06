@@ -44,6 +44,16 @@ void mk2_ble_diag_reset(void);
 /* Print the counter footer via printk. Call at dlog dump. */
 void mk2_ble_diag_dump(void);
 
+/* Record the wall-time a bt_gatt_notify_cb() call blocked (K_FOREVER PDU alloc
+ * under TX congestion), in microseconds, bucketed per pipe. */
+void mk2_ble_diag_note_block(uint8_t pipe, uint32_t block_us);
+
+/* Record a send-queue depth after enqueue; tracks the per-pipe high-water mark. */
+void mk2_ble_diag_note_queue(uint8_t pipe, uint32_t used);
+
+/* Record one dropped report (queue-full oldest-eviction), per pipe. */
+void mk2_ble_diag_note_drop(uint8_t pipe);
+
 #else
 
 static inline void mk2_ble_diag_note_notify(uint8_t pipe, int err) {
@@ -59,6 +69,15 @@ static inline void mk2_ble_diag_set_conn_params(uint16_t interval, uint16_t late
 static inline uint16_t mk2_ble_diag_interval_units(void) { return 0; }
 static inline void mk2_ble_diag_reset(void) {}
 static inline void mk2_ble_diag_dump(void) {}
+static inline void mk2_ble_diag_note_block(uint8_t pipe, uint32_t block_us) {
+    (void)pipe;
+    (void)block_us;
+}
+static inline void mk2_ble_diag_note_queue(uint8_t pipe, uint32_t used) {
+    (void)pipe;
+    (void)used;
+}
+static inline void mk2_ble_diag_note_drop(uint8_t pipe) { (void)pipe; }
 
 #endif /* CONFIG_MK2_BLE_DIAG */
 

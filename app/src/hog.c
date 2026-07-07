@@ -427,6 +427,168 @@ int zmk_hog_send_consumer_report(struct zmk_hid_consumer_report_body *report) {
 
 #if IS_ENABLED(CONFIG_ZMK_POINTING)
 
+#if IS_ENABLED(CONFIG_MK2_HOG_MOUSE_ACC)
+
+/*
+ * MK2 Phase 4: mouse delta accumulator.
+ * The 250 Hz trackball outruns BLE delivery (~66-100 reports/s at a 15 ms conn
+ * interval with 3 shared TX buffers). The stock msgq backs up, the K_FOREVER PDU
+ * alloc stalls the HOG thread, backpressure freezes the sensor poll, and the
+ * drained backlog replays stale deltas as cursor warp (measured: 11.6% of D0
+ * notifies blocked >=15 ms, q_hwm=20). Instead we coalesce pending deltas into a
+ * small button-segmented ring and send ONE fresh report per send opportunity,
+ * self-paced by the TX-buffer wait. Distinct button states open new segments so
+ * a click's press/release is preserved while the 4-slot ring has capacity; a
+ * full ring (>4 button transitions in one stall -- practically unreachable)
+ * merges into the tail with the newest buttons and is counted as a diag drop.
+ * Deltas are int64 while pending and clamped-with-carry to the int16 HID range
+ * on send. The
+ * accumulator is shared between the input-enqueue thread (producer) and the
+ * hog_work_q thread (consumer), so it is guarded by a spinlock; the blocking
+ * notify is always issued outside the lock.
+ */
+
+#define MK2_MOUSE_ACC_SEGMENTS 4
+
+struct mk2_mouse_seg {
+    zmk_mouse_button_flags_t buttons;
+    /* int64 so the producer's unchecked += can never overflow while pending,
+     * even under a long undrained stall (clamped to int16 on send). */
+    int64_t d_x, d_y, d_scroll_y, d_scroll_x;
+};
+
+static struct mk2_mouse_seg mk2_mouse_segs[MK2_MOUSE_ACC_SEGMENTS];
+static uint8_t mk2_mouse_seg_head;  /* oldest pending segment */
+static uint8_t mk2_mouse_seg_count; /* pending segments, 0..MK2_MOUSE_ACC_SEGMENTS */
+static struct k_spinlock mk2_mouse_lock;
+
+static inline int16_t mk2_clamp_i16(int64_t v) {
+    if (v > INT16_MAX) {
+        return INT16_MAX;
+    }
+    if (v < INT16_MIN) {
+        return INT16_MIN;
+    }
+    return (int16_t)v;
+}
+
+void send_mouse_report_callback(struct k_work *work) {
+    while (true) {
+        /* Acquire the connection BEFORE draining a segment: on a NULL conn we
+         * must leave the accumulator intact rather than lose the deltas. */
+        struct bt_conn *conn = zmk_ble_active_profile_conn();
+        if (conn == NULL) {
+            return;
+        }
+
+        struct zmk_hid_mouse_report_body report;
+        bool have = false;
+        k_spinlock_key_t key = k_spin_lock(&mk2_mouse_lock);
+        if (mk2_mouse_seg_count > 0) {
+            struct mk2_mouse_seg *seg = &mk2_mouse_segs[mk2_mouse_seg_head];
+            report.buttons = seg->buttons;
+            report.d_x = mk2_clamp_i16(seg->d_x);
+            report.d_y = mk2_clamp_i16(seg->d_y);
+            report.d_scroll_y = mk2_clamp_i16(seg->d_scroll_y);
+            report.d_scroll_x = mk2_clamp_i16(seg->d_scroll_x);
+            /* Clamp-and-carry: keep the residual, retire only once fully drained. */
+            seg->d_x -= report.d_x;
+            seg->d_y -= report.d_y;
+            seg->d_scroll_y -= report.d_scroll_y;
+            seg->d_scroll_x -= report.d_scroll_x;
+            if (seg->d_x == 0 && seg->d_y == 0 && seg->d_scroll_y == 0 &&
+                seg->d_scroll_x == 0) {
+                mk2_mouse_seg_head = (mk2_mouse_seg_head + 1) % MK2_MOUSE_ACC_SEGMENTS;
+                mk2_mouse_seg_count--;
+            }
+            have = true;
+        }
+        k_spin_unlock(&mk2_mouse_lock, key);
+
+        if (!have) {
+            bt_conn_unref(conn);
+            return;
+        }
+
+        struct bt_gatt_notify_params notify_params = {
+            .attr = &hog_svc.attrs[13],
+            .data = &report,
+            .len = sizeof(report),
+        };
+
+#if IS_ENABLED(CONFIG_MK2_BLE_DIAG)
+        uint32_t mk2_notify_start = k_cycle_get_32();
+#endif
+        int err = bt_gatt_notify_cb(conn, &notify_params);
+#if IS_ENABLED(CONFIG_MK2_BLE_DIAG)
+        mk2_ble_diag_note_block(MK2_BLE_DIAG_PIPE_MOUSE,
+                                k_cyc_to_us_floor32(k_cycle_get_32() - mk2_notify_start));
+#endif
+        if (err == -EPERM) {
+            bt_conn_set_security(conn, BT_SECURITY_L2);
+        } else if (err) {
+            LOG_DBG("Error notifying %d", err);
+        }
+        mk2_ble_diag_note_notify(MK2_BLE_DIAG_PIPE_MOUSE, err);
+
+        bt_conn_unref(conn);
+    }
+};
+
+K_WORK_DEFINE(hog_mouse_work, send_mouse_report_callback);
+
+void zmk_hog_clear_mouse_queue(void) {
+    k_spinlock_key_t key = k_spin_lock(&mk2_mouse_lock);
+    mk2_mouse_seg_head = 0;
+    mk2_mouse_seg_count = 0;
+    k_spin_unlock(&mk2_mouse_lock, key);
+}
+
+int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
+    k_spinlock_key_t key = k_spin_lock(&mk2_mouse_lock);
+    struct mk2_mouse_seg *tail = NULL;
+    if (mk2_mouse_seg_count > 0) {
+        uint8_t tail_idx =
+            (mk2_mouse_seg_head + mk2_mouse_seg_count - 1) % MK2_MOUSE_ACC_SEGMENTS;
+        tail = &mk2_mouse_segs[tail_idx];
+    }
+    if (tail != NULL && tail->buttons == report->buttons) {
+        /* Same button state: coalesce into the tail segment. */
+        tail->d_x += report->d_x;
+        tail->d_y += report->d_y;
+        tail->d_scroll_y += report->d_scroll_y;
+        tail->d_scroll_x += report->d_scroll_x;
+    } else if (mk2_mouse_seg_count < MK2_MOUSE_ACC_SEGMENTS) {
+        /* Button transition: open a new segment to preserve click ordering. */
+        uint8_t idx = (mk2_mouse_seg_head + mk2_mouse_seg_count) % MK2_MOUSE_ACC_SEGMENTS;
+        struct mk2_mouse_seg *seg = &mk2_mouse_segs[idx];
+        seg->buttons = report->buttons;
+        seg->d_x = report->d_x;
+        seg->d_y = report->d_y;
+        seg->d_scroll_y = report->d_scroll_y;
+        seg->d_scroll_x = report->d_scroll_x;
+        mk2_mouse_seg_count++;
+    } else {
+        /* Ring full (>2 click cycles inside one stall -- rare): merge into the
+         * tail and take the newest button state. Counted for the diagnostics. */
+        tail->d_x += report->d_x;
+        tail->d_y += report->d_y;
+        tail->d_scroll_y += report->d_scroll_y;
+        tail->d_scroll_x += report->d_scroll_x;
+        tail->buttons = report->buttons;
+        mk2_ble_diag_note_drop(MK2_BLE_DIAG_PIPE_MOUSE);
+    }
+    uint32_t used = mk2_mouse_seg_count;
+    k_spin_unlock(&mk2_mouse_lock, key);
+
+    mk2_ble_diag_note_queue(MK2_BLE_DIAG_PIPE_MOUSE, used);
+    k_work_submit_to_queue(&hog_work_q, &hog_mouse_work);
+
+    return 0;
+};
+
+#else /* !CONFIG_MK2_HOG_MOUSE_ACC: stock fixed-depth msgq (rollback path) */
+
 K_MSGQ_DEFINE(zmk_hog_mouse_msgq, sizeof(struct zmk_hid_mouse_report_body),
               CONFIG_ZMK_BLE_MOUSE_REPORT_QUEUE_SIZE, 4);
 
@@ -493,6 +655,8 @@ int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
 
     return 0;
 };
+
+#endif /* CONFIG_MK2_HOG_MOUSE_ACC */
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING)
 
 static int zmk_hog_init(void) {

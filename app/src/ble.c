@@ -704,6 +704,14 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
     if (is_conn_active_profile(conn)) {
         LOG_DBG("Active profile disconnected");
         mk2_ble_diag_set_conn_params(0, 0, 0);
+#if IS_ENABLED(CONFIG_ZMK_POINTING)
+        // Drop pending mouse motion on disconnect so a reconnect doesn't replay
+        // stale deltas as a cursor warp. Critical for the MK2_HOG_MOUSE_ACC
+        // accumulator: while disconnected the consumer can't drain (no active
+        // conn), so without this the segment deltas would grow unbounded and a
+        // reconnect would stall the shared HOG queue flushing them.
+        zmk_hog_clear_mouse_queue();
+#endif
         k_work_submit(&raise_profile_changed_event_work);
     }
 }

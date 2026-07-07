@@ -220,6 +220,19 @@ config MK2_BLE_DIAG
       characteristics and changes no connection behavior (no settings_reset
       required). Leave off for release builds.
 
+config MK2_HOG_MOUSE_ACC
+    bool "MK2: coalesce BLE mouse reports into a delta accumulator (fixes cursor lag/jumps)"
+    depends on ZMK_POINTING
+    default n
+    help
+      Phase 4 fix for BLE cursor lag + jumps. Replaces the fixed-depth mouse HID
+      msgq with a small button-segmented delta accumulator: the 250 Hz trackball
+      backlog is coalesced into one fresh relative-delta report per send
+      opportunity, self-paced by the BLE TX-buffer wait. Eliminates the queue
+      backpressure that stalls the sensor poll and the stale-delta replay that
+      shows as cursor warp under congestion. R/Central only (mouse pipe). No GATT
+      change, no settings_reset. Off restores the original msgq behavior.
+
 config ZMK_BLE_CLEAR_BONDS_ON_START
     bool "Configuration that clears all bond information from the keyboard on startup."
 

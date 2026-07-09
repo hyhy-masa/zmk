@@ -147,6 +147,10 @@ static const struct bt_uuid_128 split_service_uuid = BT_UUID_INIT_128(ZMK_SPLIT_
 
 struct peripheral_event_wrapper {
     uint8_t source;
+    /* TEMP-DIAG(left-stall): k_uptime (ms, uint32 trunc) at enqueue from the BT
+     * RX notify cb; 0 = not stamped (all other enqueue sites). uint32 keeps the
+     * msgq item aligned to 4 (see K_MSGQ_DEFINE align arg below). */
+    uint32_t enq_ms;
     struct zmk_split_transport_peripheral_event event;
 };
 
@@ -502,6 +506,27 @@ static uint8_t split_central_notify_func(struct bt_conn *conn,
         return BT_GATT_ITER_STOP;
     }
 
+    /* TEMP-DIAG(left-stall): position-notify arrival gap detector. One line when
+     * notifies resume after >1s silence, plus the next 5 arrivals to capture a
+     * peripheral-side queue-flush burst. Zero lines while typing. Single
+     * peripheral (CENTRAL_PERIPHERALS=1) so function-local statics are fine. */
+    static int64_t lin_last_ms;
+    static uint32_t lin_total;
+    static uint8_t lin_post_gap;
+    const int64_t lin_now = k_uptime_get();
+    lin_total++;
+    if (lin_last_ms != 0) {
+        const uint32_t lin_delta = (uint32_t)(lin_now - lin_last_ms);
+        if (lin_delta > 1000) {
+            printk("[LIN] gap=%u ms n=%u up=%u ms\n", lin_delta, lin_total, (uint32_t)lin_now);
+            lin_post_gap = 5;
+        } else if (lin_post_gap > 0) {
+            lin_post_gap--;
+            printk("[LIN] +%u ms n=%u post-gap\n", lin_delta, lin_total);
+        }
+    }
+    lin_last_ms = lin_now;
+
     LOG_DBG("[NOTIFICATION] data %p length %u", data, length);
 
     for (int i = 0; i < POSITION_STATE_DATA_LEN; i++) {
@@ -517,12 +542,17 @@ static uint8_t split_central_notify_func(struct bt_conn *conn,
                 bool pressed = slot->position_state[i] & BIT(j);
                 struct peripheral_event_wrapper ev = {
                     .source = peripheral_slot_index_for_conn(conn),
+                    .enq_ms = (uint32_t)lin_now, /* TEMP-DIAG(left-stall) */
                     .event = {.type = ZMK_SPLIT_TRANSPORT_PERIPHERAL_EVENT_TYPE_KEY_POSITION_EVENT,
                               .data = {.key_position_event = {
                                            .position = position,
                                            .pressed = pressed,
                                        }}}};
-                k_msgq_put(&peripheral_event_msgq, &ev, K_NO_WAIT);
+                if (k_msgq_put(&peripheral_event_msgq, &ev, K_NO_WAIT) != 0) {
+                    /* TEMP-DIAG(left-stall): 5-deep msgq overflow = system WQ stalled. */
+                    printk("[LIN] DROP pos=%u q=%u up=%u ms\n", position,
+                           k_msgq_num_used_get(&peripheral_event_msgq), (uint32_t)lin_now);
+                }
                 k_work_submit(&peripheral_event_work);
             }
         }
@@ -1454,6 +1484,17 @@ static int finish_init() {
 void peripheral_event_work_callback(struct k_work *work) {
     struct peripheral_event_wrapper ev;
     while (k_msgq_get(&peripheral_event_msgq, &ev, K_NO_WAIT) == 0) {
+        /* TEMP-DIAG(left-stall): BT-RX -> system-WQ delivery latency for L key
+         * events. Prints only when >1s stale (never fires when healthy). */
+        if (ev.event.type == ZMK_SPLIT_TRANSPORT_PERIPHERAL_EVENT_TYPE_KEY_POSITION_EVENT &&
+            ev.enq_ms != 0) {
+            const uint32_t lwk_lat = (uint32_t)k_uptime_get() - ev.enq_ms;
+            if (lwk_lat > 1000) {
+                printk("[LWK] lat=%u ms pos=%u q=%u up=%u ms\n", lwk_lat,
+                       ev.event.data.key_position_event.position,
+                       k_msgq_num_used_get(&peripheral_event_msgq), (uint32_t)k_uptime_get());
+            }
+        }
         LOG_DBG("Trigger key position state change for %d",
                 ev.event.data.key_position_event.position);
         zmk_split_transport_central_peripheral_event_handler(&bt_central, ev.source, ev.event);

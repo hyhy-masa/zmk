@@ -14,6 +14,7 @@
 #include <zephyr/bluetooth/hci.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/printk.h>
 
 #include <zephyr/logging/log.h>
 
@@ -1100,6 +1101,8 @@ static void split_central_connected(struct bt_conn *conn, uint8_t conn_err) {
     }
 
     LOG_DBG("Connected: %s", addr);
+    /* TEMP-DIAG: split-link connect breadcrumb over USB console (reason capture). */
+    printk("[SPLIT] Connected: %s up=%u ms\n", addr, (uint32_t)k_uptime_get());
 
     confirm_peripheral_slot_conn(conn);
     split_central_process_connection(conn);
@@ -1113,6 +1116,11 @@ static void split_central_disconnected(struct bt_conn *conn, uint8_t reason) {
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
     LOG_DBG("Disconnected: %s (reason %d)", addr, reason);
+    /* TEMP-DIAG: split-link disconnect reason over USB console. Fires for both the
+     * L peripheral link and the Mac host link; distinguish by addr. Remove after
+     * capturing the intermittent left-half drop reason (watch_disconnect.py). */
+    printk("[SPLIT] Disconnected: %s (reason 0x%02x) up=%u ms\n", addr, reason,
+           (uint32_t)k_uptime_get());
 
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING)
     struct peripheral_event_wrapper ev = {

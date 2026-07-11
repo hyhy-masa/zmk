@@ -15,6 +15,7 @@
 #include <zephyr/settings/settings.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/printk.h>
+#include <zephyr/drivers/hwinfo.h>
 
 #include <zephyr/logging/log.h>
 
@@ -34,6 +35,33 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/pointing/input_split.h>
 #include <zmk/hid_indicators_types.h>
 #include <zmk/physical_layouts.h>
+
+/* TEMP-DIAG(left-stall): boot-reason + heartbeat to confirm whether R reboots and
+ * why. up= is ms since boot (a small up after a BLE-only session = R rebooted).
+ * reset bits: SOFTWARE=0x2 BROWNOUT=0x4 POR=0x8 WATCHDOG=0x10 LOCKUP=0x100.
+ * A1(power)=BROWNOUT/POR, A2(crash)=LOCKUP. Heartbeat lets us read the last boot's
+ * cause after plugging USB back in. Remove after capture. */
+static uint32_t mk2_diag_reset_cause;
+
+static void mk2_diag_hb_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(mk2_diag_hb, mk2_diag_hb_handler);
+
+static void mk2_diag_hb_handler(struct k_work *work) {
+    printk("[HB] up=%u ms reset=0x%08x\n", (uint32_t)k_uptime_get(), mk2_diag_reset_cause);
+    k_work_reschedule(&mk2_diag_hb, K_SECONDS(15));
+}
+
+static int mk2_diag_boot_init(void) {
+    if (hwinfo_get_reset_cause(&mk2_diag_reset_cause) != 0) {
+        mk2_diag_reset_cause = 0xFFFFFFFFU; /* hwinfo unavailable */
+    } else {
+        hwinfo_clear_reset_cause(); /* keep each boot's cause independent */
+    }
+    printk("[BOOT] up=0 reset=0x%08x\n", mk2_diag_reset_cause);
+    k_work_schedule(&mk2_diag_hb, K_SECONDS(15));
+    return 0;
+}
+SYS_INIT(mk2_diag_boot_init, APPLICATION, CONFIG_ZMK_BLE_INIT_PRIORITY);
 
 static int start_scanning(void);
 

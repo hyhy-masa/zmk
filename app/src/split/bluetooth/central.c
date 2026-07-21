@@ -6,6 +6,7 @@
 
 #include <zephyr/types.h>
 #include <zephyr/init.h>
+#include <zephyr/kernel.h>
 
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
@@ -14,6 +15,7 @@
 #include <zephyr/bluetooth/hci.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/printk.h>
 
 #include <zephyr/logging/log.h>
 
@@ -32,6 +34,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/events/battery_state_changed.h>
 #include <zmk/pointing/input_split.h>
 #include <zmk/hid_indicators_types.h>
+#include <zmk/mk2_split_stats.h>
 #include <zmk/physical_layouts.h>
 
 static int start_scanning(void);
@@ -137,6 +140,43 @@ void release_peripheral_input_subs(struct bt_conn *conn) {
 
 static zmk_split_transport_central_status_changed_cb_t transport_status_cb;
 static bool is_enabled;
+
+#if IS_ENABLED(CONFIG_MK2_SPLIT_POS_DROP_STATS)
+
+#include <errno.h>
+
+#if CONFIG_MK2_SPLIT_POS_DROP_SELFTEST > 0
+#warning "MK2_SPLIT_POS_DROP_SELFTEST is a fault injection build that can stick keys - bench only, do not ship"
+#endif
+
+static uint32_t split_pos_drop_count;
+static uint32_t split_pos_drop_max_q;
+static uint32_t split_pos_drop_last_pos;
+static uint32_t split_pos_drop_last_up_ms;
+
+#if CONFIG_MK2_SPLIT_POS_DROP_SELFTEST > 0
+static uint32_t split_pos_drop_selftest_attempt;
+#endif
+
+void mk2_split_pos_drop_dump(void) {
+    /* now_ms closes the measurement window: without it a drop count cannot be told
+     * apart from a stale one, and no rate can be derived. */
+    printk("[MK2_DIAG] split_pos_drop=%u,max_q=%u,last_pos=%u,last_up_ms=%u,now_ms=%u\n",
+           split_pos_drop_count, split_pos_drop_max_q, split_pos_drop_last_pos,
+           split_pos_drop_last_up_ms, k_uptime_get_32());
+}
+
+/* Called from mk2_ble_diag_reset() so these counters share the measurement window with
+ * the mk2_diag_* counters. Without this, a DLOG_CLEAR -> use -> DLOG_DUMP cycle would
+ * print a windowed number next to a since-boot number and the two could not be compared. */
+void mk2_split_pos_drop_reset(void) {
+    split_pos_drop_count = 0;
+    split_pos_drop_max_q = 0;
+    split_pos_drop_last_pos = 0;
+    split_pos_drop_last_up_ms = 0;
+}
+
+#endif /* CONFIG_MK2_SPLIT_POS_DROP_STATS */
 
 static struct peripheral_slot peripherals[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
 
@@ -521,7 +561,37 @@ static uint8_t split_central_notify_func(struct bt_conn *conn,
                                            .position = position,
                                            .pressed = pressed,
                                        }}}};
+#if IS_ENABLED(CONFIG_MK2_SPLIT_POS_DROP_STATS)
+                int put_err;
+
+#if CONFIG_MK2_SPLIT_POS_DROP_SELFTEST > 0
+                /* Fault injection: skipping the put loses a decoded press/release edge, which
+                 * is precisely how a key or layer gets stuck. Bench use only. */
+                split_pos_drop_selftest_attempt++;
+                if (split_pos_drop_selftest_attempt % CONFIG_MK2_SPLIT_POS_DROP_SELFTEST == 0) {
+                    put_err = -ENOMSG;
+                } else {
+                    put_err = k_msgq_put(&peripheral_event_msgq, &ev, K_NO_WAIT);
+                }
+#else
+                put_err = k_msgq_put(&peripheral_event_msgq, &ev, K_NO_WAIT);
+#endif
+                /* Sampled on every event, not just on failure: after a failed put the queue is
+                 * by definition full, so sampling only there would pin max_q to the queue size
+                 * and tell us nothing about the normal headroom. */
+                uint32_t queue_depth = k_msgq_num_used_get(&peripheral_event_msgq);
+
+                if (queue_depth > split_pos_drop_max_q) {
+                    split_pos_drop_max_q = queue_depth;
+                }
+                if (put_err != 0) {
+                    split_pos_drop_count++;
+                    split_pos_drop_last_pos = position;
+                    split_pos_drop_last_up_ms = k_uptime_get_32();
+                }
+#else
                 k_msgq_put(&peripheral_event_msgq, &ev, K_NO_WAIT);
+#endif
                 k_work_submit(&peripheral_event_work);
             }
         }

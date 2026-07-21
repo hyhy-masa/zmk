@@ -233,6 +233,60 @@ config MK2_HOG_MOUSE_ACC
       shows as cursor warp under congestion. R/Central only (mouse pipe). No GATT
       change, no settings_reset. Off restores the original msgq behavior.
 
+config MK2_SPLIT_POS_DROP_STATS
+    bool "MK2: split position drop statistics"
+    default n
+    depends on ZMK_SPLIT && ZMK_SPLIT_BLE && ZMK_SPLIT_ROLE_CENTRAL && MK2_BLE_DIAG
+    help
+      Measurement-only counters for dropped split position events on the Central.
+      This does not change keyboard behavior, ordering, or retry handling.
+      Depends on MK2_BLE_DIAG because the only readout path is the [MK2_DIAG]
+      footer: without it the counters would tick but never be printed, which
+      would silently look like "no drops".
+
+config MK2_SPLIT_POS_DROP_SELFTEST
+    int "MK2: split position drop self-test interval"
+    default 0
+    range 0 10000
+    depends on MK2_SPLIT_POS_DROP_STATS
+    help
+      Bench calibration only. Drops every Nth peripheral key position event
+      before it is queued, which both bumps the counters and reproduces a stuck
+      key, proving the instrument works before any field measurement is trusted.
+      FAULT INJECTION - zero disables it and leaves behavior unchanged.
+
+config MK2_SPLIT_NOTIFY_STATS
+    bool "MK2: split notification statistics"
+    default n
+    depends on ZMK_SPLIT && ZMK_SPLIT_BLE && !ZMK_SPLIT_ROLE_CENTRAL
+    select ZMK_LOW_PRIORITY_WORK_QUEUE
+    help
+      Measurement-only counters for split position notifications on the Peripheral.
+      This does not change keyboard behavior, ordering, or retry handling.
+      The readout needs a console the host can assert DTR on; on a peripheral
+      CONFIG_ZMK_USB is unavailable, so the board overlay must point
+      chosen zephyr,console at a cdc-acm node itself.
+
+config MK2_SPLIT_NOTIFY_STATS_DUMP_MS
+    int "MK2: split notification statistics dump interval"
+    default 10000
+    range 100 3600000
+    depends on MK2_SPLIT_NOTIFY_STATS
+    help
+      Measurement-only periodic dump interval in milliseconds. The dump remains
+      silent unless a ready console has an attached USB host with DTR asserted.
+
+config MK2_SPLIT_NOTIFY_STATS_SELFTEST
+    int "MK2: split notification statistics self-test interval"
+    default 0
+    range 0 10000
+    depends on MK2_SPLIT_NOTIFY_STATS
+    help
+      Measurement-only bench calibration that treats every Nth notification as
+      -ENOMEM without sending it. Zero disables it and leaves behavior unchanged.
+      FAULT INJECTION - a skipped notification can leave a key or layer stuck
+      exactly like the defect under investigation, so never ship this enabled.
+
 config ZMK_BLE_CLEAR_BONDS_ON_START
     bool "Configuration that clears all bond information from the keyboard on startup."
 

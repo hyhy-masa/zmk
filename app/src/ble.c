@@ -34,6 +34,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/ble.h>
 #include <zmk/hog.h>
 #include <zmk/mk2_ble_diag.h>
+#include <zmk/mk2_split_stats.h>
 #include <zmk/keys.h>
 #include <zmk/split/bluetooth/uuid.h>
 #include <zmk/event_manager.h>
@@ -625,6 +626,9 @@ void mk2_ble_diag_reset(void) {
     memset(mk2_diag_block_max_us, 0, sizeof(mk2_diag_block_max_us));
     memset(mk2_diag_queue_hwm, 0, sizeof(mk2_diag_queue_hwm));
     memset(mk2_diag_drop, 0, sizeof(mk2_diag_drop));
+    /* Keep the split position drop counters on the same measurement window as the
+     * counters above, so a DLOG_CLEAR -> use -> DLOG_DUMP cycle yields comparable numbers. */
+    mk2_split_pos_drop_reset();
 }
 
 void mk2_ble_diag_dump(void) {
@@ -646,6 +650,7 @@ void mk2_ble_diag_dump(void) {
     printk("conn_interval_units=%u,latency=%u,timeout=%u\n",
            (uint16_t)atomic_get(&mk2_diag_interval), (uint16_t)atomic_get(&mk2_diag_latency),
            (uint16_t)atomic_get(&mk2_diag_timeout));
+    mk2_split_pos_drop_dump();
 }
 
 #endif /* CONFIG_MK2_BLE_DIAG */

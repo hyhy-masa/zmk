@@ -5,10 +5,18 @@
  */
 
 #include <zephyr/drivers/sensor.h>
+#include <zephyr/drivers/uart.h>
+#include <zephyr/device.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/kernel.h>
 #include <zephyr/types.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/printk.h>
 #include <zephyr/init.h>
+
+#include <errno.h>
+#include <string.h>
 
 #include <zephyr/logging/log.h>
 
@@ -25,6 +33,9 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/split/transport/peripheral.h>
 #include <zmk/split/bluetooth/uuid.h>
 #include <zmk/split/bluetooth/service.h>
+#if IS_ENABLED(CONFIG_MK2_SPLIT_NOTIFY_STATS)
+#include <zmk/workqueue.h>
+#endif
 
 #include "peripheral.h"
 
@@ -300,11 +311,115 @@ struct k_work_q service_work_q;
 K_MSGQ_DEFINE(position_state_msgq, sizeof(char[POS_STATE_LEN]),
               CONFIG_ZMK_SPLIT_BLE_PERIPHERAL_POSITION_QUEUE_SIZE, 4);
 
+#if IS_ENABLED(CONFIG_MK2_SPLIT_NOTIFY_STATS)
+
+static uint32_t split_notify_ok;
+static uint32_t split_notify_fail[5];
+static int split_notify_last_err;
+static uint32_t split_notify_evicted;
+
+#if CONFIG_MK2_SPLIT_NOTIFY_STATS_SELFTEST > 0
+static uint32_t split_notify_selftest_attempt;
+#endif
+
+static int split_notify_err_bucket(int err) {
+    switch (err) {
+    case -EPERM:
+        return 0;
+    case -ENOMEM:
+        return 1;
+    case -EAGAIN:
+        return 2;
+    case -ENOTCONN:
+        return 3;
+    default:
+        return 4;
+    }
+}
+
+/* DT_HAS_CHOSEN() alone is not enough: it is still true when the chosen console points at a
+ * disabled UART, and DEVICE_DT_GET() on a disabled node fails to link (__device_dts_ord_N
+ * undeclared). That is exactly how a previous peripheral USB-logging attempt broke the build,
+ * so the node status is checked too. */
+#if DT_HAS_CHOSEN(zephyr_console) && DT_NODE_HAS_STATUS(DT_CHOSEN(zephyr_console), okay) &&        \
+    IS_ENABLED(CONFIG_UART_LINE_CTRL)
+
+BUILD_ASSERT(POS_STATE_LEN == 16, "[NGUARD] pos= formatting expects a 16 byte position state");
+
+static void split_notify_stats_dump_callback(struct k_work *work) {
+    const struct device *dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+    uint32_t dtr = 0;
+
+    if (device_is_ready(dev) && uart_line_ctrl_get(dev, UART_LINE_CTRL_DTR, &dtr) == 0 && dtr) {
+        uint8_t state[POS_STATE_LEN];
+        unsigned int key = irq_lock();
+
+        memcpy(state, position_state, sizeof(state));
+        irq_unlock(key);
+
+        /* Split across two calls so neither spills a large argument list onto the stack. */
+        printk("[NGUARD] ok=%u eperm=%u enomem=%u eagain=%u enotconn=%u other=%u "
+               "last_err=%d evicted=%u up=%u\n",
+               split_notify_ok, split_notify_fail[0], split_notify_fail[1], split_notify_fail[2],
+               split_notify_fail[3], split_notify_fail[4], split_notify_last_err,
+               split_notify_evicted, k_uptime_get_32());
+        /* pos= is the peripheral's own view of which keys are held. If it shows a key down
+         * that is physically released, the fault is in key scanning, not in the notify path. */
+        printk("[NGUARD] pos=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+               state[0], state[1], state[2], state[3], state[4], state[5], state[6], state[7],
+               state[8], state[9], state[10], state[11], state[12], state[13], state[14],
+               state[15]);
+    }
+
+    /* Rescheduled onto the low priority queue, never service_work_q: that queue is the one
+     * carrying the position notifications being measured, and a console write blocking on the
+     * host would inject stalls into the very path under observation. */
+    k_work_reschedule_for_queue(zmk_workqueue_lowprio_work_q(), k_work_delayable_from_work(work),
+                                K_MSEC(CONFIG_MK2_SPLIT_NOTIFY_STATS_DUMP_MS));
+}
+
+static K_WORK_DELAYABLE_DEFINE(split_notify_stats_dump_work, split_notify_stats_dump_callback);
+
+#else
+
+/* Fail loud: the counters would still tick here but nothing could ever read them, and an empty
+ * readout reads exactly like "no failures". */
+#warning "MK2_SPLIT_NOTIFY_STATS is on but no DTR-capable console is chosen: the [NGUARD] counters cannot be read out"
+
+#endif /* chosen console is present and okay && CONFIG_UART_LINE_CTRL */
+
+#if CONFIG_MK2_SPLIT_NOTIFY_STATS_SELFTEST > 0
+#warning "MK2_SPLIT_NOTIFY_STATS_SELFTEST is a fault injection build that can stick keys - bench only, do not ship"
+#endif
+
+#endif /* CONFIG_MK2_SPLIT_NOTIFY_STATS */
+
 void send_position_state_callback(struct k_work *work) {
     uint8_t state[POS_STATE_LEN];
 
     while (k_msgq_get(&position_state_msgq, &state, K_NO_WAIT) == 0) {
+#if IS_ENABLED(CONFIG_MK2_SPLIT_NOTIFY_STATS)
+        int err;
+
+#if CONFIG_MK2_SPLIT_NOTIFY_STATS_SELFTEST > 0
+        split_notify_selftest_attempt++;
+        if (split_notify_selftest_attempt % CONFIG_MK2_SPLIT_NOTIFY_STATS_SELFTEST == 0) {
+            err = -ENOMEM;
+        } else {
+            err = bt_gatt_notify(NULL, &split_svc.attrs[1], &state, sizeof(state));
+        }
+#else
+        err = bt_gatt_notify(NULL, &split_svc.attrs[1], &state, sizeof(state));
+#endif
+        if (err == 0) {
+            split_notify_ok++;
+        } else {
+            split_notify_fail[split_notify_err_bucket(err)]++;
+            split_notify_last_err = err;
+        }
+#else
         int err = bt_gatt_notify(NULL, &split_svc.attrs[1], &state, sizeof(state));
+#endif
         if (err) {
             LOG_DBG("Error notifying %d", err);
         }
@@ -321,6 +436,12 @@ int send_position_state() {
             LOG_WRN("Position state message queue full, popping first message and queueing again");
             uint8_t discarded_state[POS_STATE_LEN];
             k_msgq_get(&position_state_msgq, &discarded_state, K_NO_WAIT);
+#if IS_ENABLED(CONFIG_MK2_SPLIT_NOTIFY_STATS)
+            /* Unlike the other counters this one is bumped from the calling (key event)
+             * thread, not from service_work_q. It stays a single producer and a 32 bit
+             * aligned store is indivisible on Cortex-M, so no lock is needed. */
+            split_notify_evicted++;
+#endif
             return send_position_state();
         }
         default:
@@ -499,6 +620,12 @@ static int service_init(void) {
         .name = "Split Peripheral Notification Queue"};
     k_work_queue_start(&service_work_q, service_q_stack, K_THREAD_STACK_SIZEOF(service_q_stack),
                        CONFIG_ZMK_SPLIT_BLE_PERIPHERAL_PRIORITY, &queue_config);
+
+#if IS_ENABLED(CONFIG_MK2_SPLIT_NOTIFY_STATS) && DT_HAS_CHOSEN(zephyr_console) &&                  \
+    DT_NODE_HAS_STATUS(DT_CHOSEN(zephyr_console), okay) && IS_ENABLED(CONFIG_UART_LINE_CTRL)
+    k_work_schedule_for_queue(zmk_workqueue_lowprio_work_q(), &split_notify_stats_dump_work,
+                              K_MSEC(CONFIG_MK2_SPLIT_NOTIFY_STATS_DUMP_MS));
+#endif
 
     return 0;
 }

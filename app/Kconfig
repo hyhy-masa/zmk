@@ -220,6 +220,18 @@ config MK2_BLE_DIAG
       characteristics and changes no connection behavior (no settings_reset
       required). Leave off for release builds.
 
+config MK2_MATRIX_DIAG
+    bool "MK2: Matrix GPIO diagnostic (short/open detection without key press)"
+    default n
+    help
+      QC self-test for keyboard matrix wiring after FW flash. Tests GPIO
+      output/input function, detects col-col / row-row / col-row shorts,
+      and verifies pull-down integrity — all without pressing any key.
+      Triggered by USB serial command "DIAG_MATRIX" from host. Results
+      printed via printk in [MATRIX_DIAG_START]/[MATRIX_DIAG_END] markers.
+      Adds no GATT characteristics, no settings_reset required.
+      Leave off for release builds.
+
 config MK2_HOG_MOUSE_ACC
     bool "MK2: coalesce BLE mouse reports into a delta accumulator (fixes cursor lag/jumps)"
     depends on ZMK_POINTING

@@ -232,6 +232,34 @@ config MK2_MATRIX_DIAG
       Adds no GATT characteristics, no settings_reset required.
       Leave off for release builds.
 
+config MK2_HOLD_TAP_CAPTURE_STATS
+    bool "MK2: count hold-tap captured-event overflows"
+    default n
+    depends on ZMK_BEHAVIOR_HOLD_TAP
+    help
+      While a hold-tap is undecided, every other key event is parked in
+      captured_events[] and replayed once the hold/tap question is settled.
+      If that array is full the event is dropped, yet the listener still
+      answers ZMK_EV_EVENT_CAPTURED — telling the event system it was taken
+      when it was not. A dropped key release never comes back, which leaves
+      that key held forever.
+
+      Whether this actually happens is unknown: nothing counts it today.
+      This adds two counters — overflows, and the high water mark of the
+      array — so the question can be answered from a real keyboard instead
+      of by reading the code. Measurement only: the drop still happens
+      exactly as before, so behaviour is unchanged.
+
+      Printed every MK2_HOLD_TAP_CAPTURE_STATS_DUMP_MS as [HTGUARD] on the
+      console, and only while a host asserts DTR. Leave off for release.
+
+config MK2_HOLD_TAP_CAPTURE_STATS_DUMP_MS
+    int "MK2: [HTGUARD] readout interval (ms)"
+    default 10000
+    depends on MK2_HOLD_TAP_CAPTURE_STATS
+    help
+      Matches the [NGUARD] cadence so both readouts line up in one log.
+
 config MK2_HOG_MOUSE_ACC
     bool "MK2: coalesce BLE mouse reports into a delta accumulator (fixes cursor lag/jumps)"
     depends on ZMK_POINTING

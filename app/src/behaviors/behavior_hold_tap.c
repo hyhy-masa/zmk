@@ -23,6 +23,13 @@
 #include <zmk/runtime_hold_tap.h>
 #endif
 
+#if IS_ENABLED(CONFIG_MK2_HOLD_TAP_CAPTURE_STATS)
+#include <zephyr/init.h>
+#include <zephyr/drivers/uart.h>
+#include <zephyr/sys/printk.h>
+#include <zmk/workqueue.h>
+#endif
+
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 #if DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT)
@@ -191,13 +198,34 @@ static bool is_quick_tap(struct active_hold_tap *hold_tap) {
     }
 }
 
+#if IS_ENABLED(CONFIG_MK2_HOLD_TAP_CAPTURE_STATS)
+/* Measurement only. The drop below is left exactly as it was; these counters just make
+ * it visible. mk2_ht_overflow rising at all means a parked event was thrown away while
+ * the listener reported ZMK_EV_EVENT_CAPTURED, and a discarded release is a key that
+ * stays held. mk2_ht_hwm is the counterweight: if it never approaches the array size,
+ * the array was never close to full and overflow cannot be the explanation. */
+static uint32_t mk2_ht_overflow;
+static uint32_t mk2_ht_hwm;
+static uint32_t mk2_ht_last_overflow_ms;
+#endif
+
 static int capture_event(struct captured_event *data) {
     for (int i = 0; i < ZMK_BHV_HOLD_TAP_MAX_CAPTURED_EVENTS; i++) {
         if (captured_events[i].tag == ET_NONE) {
             captured_events[i] = *data;
+#if IS_ENABLED(CONFIG_MK2_HOLD_TAP_CAPTURE_STATS)
+            /* i is the index just filled, so i + 1 slots are now in use. */
+            if ((uint32_t)(i + 1) > mk2_ht_hwm) {
+                mk2_ht_hwm = i + 1;
+            }
+#endif
             return 0;
         }
     }
+#if IS_ENABLED(CONFIG_MK2_HOLD_TAP_CAPTURE_STATS)
+    mk2_ht_overflow++;
+    mk2_ht_last_overflow_ms = k_uptime_get_32();
+#endif
     return -ENOMEM;
 }
 
@@ -930,5 +958,59 @@ static int behavior_hold_tap_init(const struct device *dev) {
                             CONFIG_KERNEL_INIT_PRIORITY_DEFAULT, &behavior_hold_tap_driver_api);
 
 DT_INST_FOREACH_STATUS_OKAY(KP_INST)
+
+/* ── [HTGUARD] readout ──
+ *
+ * Same shape and cadence as the peripheral's [NGUARD] line so a single console log can
+ * be read with one set of eyes. Silent unless a host asserts DTR, so normal wireless use
+ * is untouched.
+ *
+ * hwm is the number that decides the question. The array holds
+ * ZMK_BHV_HOLD_TAP_MAX_CAPTURED_EVENTS entries; if hwm stays far below that during days
+ * of real typing, the array was never near full and overflow cannot be what strands a
+ * key. Only if hwm reaches the ceiling does overflow become a candidate.
+ */
+#if IS_ENABLED(CONFIG_MK2_HOLD_TAP_CAPTURE_STATS)
+
+#if DT_HAS_CHOSEN(zephyr_console) && DT_NODE_HAS_STATUS(DT_CHOSEN(zephyr_console), okay) &&        \
+    IS_ENABLED(CONFIG_UART_LINE_CTRL)
+
+static void mk2_ht_stats_dump_callback(struct k_work *work) {
+    const struct device *dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+    uint32_t dtr = 0;
+
+    if (device_is_ready(dev) && uart_line_ctrl_get(dev, UART_LINE_CTRL_DTR, &dtr) == 0 && dtr) {
+        printk("[HTGUARD] overflow=%u hwm=%u/%u last_overflow_ms=%u up=%u\n", mk2_ht_overflow,
+               mk2_ht_hwm, (uint32_t)ZMK_BHV_HOLD_TAP_MAX_CAPTURED_EVENTS,
+               mk2_ht_last_overflow_ms, k_uptime_get_32());
+    }
+
+    /* Low priority queue, never the one carrying key events: a console write blocking on
+     * the host must not add latency to the path being measured. */
+    k_work_reschedule_for_queue(zmk_workqueue_lowprio_work_q(), k_work_delayable_from_work(work),
+                                K_MSEC(CONFIG_MK2_HOLD_TAP_CAPTURE_STATS_DUMP_MS));
+}
+
+static K_WORK_DELAYABLE_DEFINE(mk2_ht_stats_dump_work, mk2_ht_stats_dump_callback);
+
+static int mk2_ht_stats_init(void) {
+    k_work_reschedule_for_queue(zmk_workqueue_lowprio_work_q(), &mk2_ht_stats_dump_work,
+                                K_MSEC(CONFIG_MK2_HOLD_TAP_CAPTURE_STATS_DUMP_MS));
+    return 0;
+}
+
+/* SYS_INIT rather than behavior_hold_tap_init: that init runs once per hold-tap instance
+ * and would reschedule the same work several times. */
+SYS_INIT(mk2_ht_stats_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
+
+#else
+
+/* Fail loud: the counters would still tick but nothing could read them back, and an empty
+ * readout is indistinguishable from "no overflows". */
+#warning "MK2_HOLD_TAP_CAPTURE_STATS is on but no DTR-capable console is chosen: [HTGUARD] cannot be read out"
+
+#endif /* chosen console present and okay && CONFIG_UART_LINE_CTRL */
+
+#endif /* CONFIG_MK2_HOLD_TAP_CAPTURE_STATS */
 
 #endif /* DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT) */

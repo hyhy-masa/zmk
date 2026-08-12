@@ -629,6 +629,7 @@ void mk2_ble_diag_reset(void) {
     /* Keep the split position drop counters on the same measurement window as the
      * counters above, so a DLOG_CLEAR -> use -> DLOG_DUMP cycle yields comparable numbers. */
     mk2_split_pos_drop_reset();
+    mk2_split_link_reset();
 }
 
 void mk2_ble_diag_dump(void) {
@@ -651,6 +652,7 @@ void mk2_ble_diag_dump(void) {
            (uint16_t)atomic_get(&mk2_diag_interval), (uint16_t)atomic_get(&mk2_diag_latency),
            (uint16_t)atomic_get(&mk2_diag_timeout));
     mk2_split_pos_drop_dump();
+    mk2_split_link_dump();
 }
 
 #endif /* CONFIG_MK2_BLE_DIAG */

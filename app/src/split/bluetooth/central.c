@@ -178,6 +178,75 @@ void mk2_split_pos_drop_reset(void) {
 
 #endif /* CONFIG_MK2_SPLIT_POS_DROP_STATS */
 
+#if IS_ENABLED(CONFIG_MK2_SPLIT_LINK_STATS)
+
+/* The left half drops its link to the central and comes back about three seconds later,
+ * on some host machines and not others. Three seconds means the link is being torn down
+ * and re-established, not that the peripheral hung or rebooted - a reboot would take far
+ * longer to reappear. What is missing is why it was torn down.
+ *
+ * A printk at the moment of disconnect (the July attempt) only helps if a host happens to
+ * be attached to the console right then, which is why that attempt captured nothing. These
+ * counters keep the answer until somebody asks for it, so the cable can be plugged in
+ * afterwards - and the same readout works on a customer's keyboard, where nobody is going
+ * to sit watching a serial console.
+ *
+ * reason is the HCI error code from the controller. 0x08 is a supervision timeout, meaning
+ * the halves stopped hearing each other; 0x13/0x16 mean one side asked to close the link;
+ * 0x3e means a connection attempt failed to complete. Which of those it is decides whether
+ * this is a radio problem or a protocol one, and they call for opposite fixes. */
+static uint32_t split_link_disc_count;
+static uint32_t split_link_conn_count;
+static uint8_t split_link_last_reason;
+static uint32_t split_link_last_disc_ms;
+static uint32_t split_link_last_conn_ms;
+/* Shortest observed gap between a disconnect and the reconnect that followed it. A drop
+ * nobody notices and one that interrupts typing look identical in a count; the gap is what
+ * separates them. */
+static uint32_t split_link_min_gap_ms;
+
+void mk2_split_link_dump(void) {
+    printk("[SPLINK] disc=%u conn=%u last_reason=0x%02x last_disc_ms=%u last_conn_ms=%u "
+           "min_gap_ms=%u now_ms=%u\n",
+           split_link_disc_count, split_link_conn_count, split_link_last_reason,
+           split_link_last_disc_ms, split_link_last_conn_ms, split_link_min_gap_ms,
+           k_uptime_get_32());
+}
+
+void mk2_split_link_reset(void) {
+    split_link_disc_count = 0;
+    split_link_conn_count = 0;
+    split_link_last_reason = 0;
+    split_link_last_disc_ms = 0;
+    split_link_last_conn_ms = 0;
+    split_link_min_gap_ms = 0;
+}
+
+static void mk2_split_link_note_disconnect(uint8_t reason) {
+    split_link_disc_count++;
+    split_link_last_reason = reason;
+    split_link_last_disc_ms = k_uptime_get_32();
+}
+
+static void mk2_split_link_note_connect(void) {
+    uint32_t now = k_uptime_get_32();
+
+    split_link_conn_count++;
+    split_link_last_conn_ms = now;
+
+    /* Only a reconnect that follows a disconnect measures an outage; the very first
+     * connect after boot has nothing before it to measure against. */
+    if (split_link_last_disc_ms != 0 && now > split_link_last_disc_ms) {
+        uint32_t gap = now - split_link_last_disc_ms;
+
+        if (split_link_min_gap_ms == 0 || gap < split_link_min_gap_ms) {
+            split_link_min_gap_ms = gap;
+        }
+    }
+}
+
+#endif /* CONFIG_MK2_SPLIT_LINK_STATS */
+
 static struct peripheral_slot peripherals[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
 
 static bool is_scanning = false;
@@ -1171,6 +1240,13 @@ static void split_central_connected(struct bt_conn *conn, uint8_t conn_err) {
 
     LOG_DBG("Connected: %s", addr);
 
+#if IS_ENABLED(CONFIG_MK2_SPLIT_LINK_STATS)
+    /* Counted only on a real connection: the conn_err path above returns before reaching
+     * here, so a failed attempt is not mistaken for a recovery. */
+    mk2_split_link_note_connect();
+    printk("[SPLINK] connect up=%u ms\n", k_uptime_get_32());
+#endif
+
     confirm_peripheral_slot_conn(conn);
     split_central_process_connection(conn);
     k_work_submit(&notify_status_work);
@@ -1183,6 +1259,14 @@ static void split_central_disconnected(struct bt_conn *conn, uint8_t reason) {
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
     LOG_DBG("Disconnected: %s (reason %d)", addr, reason);
+
+#if IS_ENABLED(CONFIG_MK2_SPLIT_LINK_STATS)
+    mk2_split_link_note_disconnect(reason);
+    /* Printed as well as counted: when a console does happen to be attached, the line
+     * carries a timestamp the counters cannot, which is what ties a drop to whatever the
+     * host was doing at that moment. */
+    printk("[SPLINK] disconnect reason=0x%02x up=%u ms\n", reason, k_uptime_get_32());
+#endif
 
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING)
     struct peripheral_event_wrapper ev = {

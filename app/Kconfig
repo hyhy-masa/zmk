@@ -233,6 +233,31 @@ config MK2_HOG_MOUSE_ACC
       shows as cursor warp under congestion. R/Central only (mouse pipe). No GATT
       change, no settings_reset. Off restores the original msgq behavior.
 
+config MK2_SPLIT_LINK_STATS
+    bool "MK2: split link connect/disconnect statistics"
+    default n
+    depends on ZMK_SPLIT && ZMK_SPLIT_BLE && ZMK_SPLIT_ROLE_CENTRAL && MK2_BLE_DIAG
+    help
+      Records why the link to the peripheral went down and how long it stayed down.
+      The reported symptom is the left half dropping and returning about three
+      seconds later, on some host machines and not others. Three seconds points at
+      the link being torn down and re-established rather than the peripheral hanging
+      or rebooting, but nothing today records the reason.
+
+      A printk alone was tried in July and captured nothing, because it only helps if
+      a console happens to be attached at that instant. These counters hold the last
+      reason, the counts and the shortest observed outage until somebody asks for them
+      through the [MK2_DIAG] footer - so the cable can be attached afterwards, and so
+      the same readout works on a customer's keyboard.
+
+      reason is the HCI error code: 0x08 supervision timeout (the halves stopped
+      hearing each other), 0x13/0x16 one side closed the link deliberately, 0x3e a
+      connection attempt never completed. Radio problems and protocol problems call
+      for opposite fixes, and this is what tells them apart.
+
+      Measurement only: no GATT change, no settings_reset, no change to connection
+      handling. Depends on MK2_BLE_DIAG because that footer is the only readout path.
+
 config MK2_SPLIT_POS_DROP_STATS
     bool "MK2: split position drop statistics"
     default n

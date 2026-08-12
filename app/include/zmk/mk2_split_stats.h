@@ -23,6 +23,18 @@ static inline void mk2_split_pos_drop_reset(void) {}
 
 #endif /* CONFIG_MK2_SPLIT_POS_DROP_STATS */
 
+#if IS_ENABLED(CONFIG_MK2_SPLIT_LINK_STATS)
+
+void mk2_split_link_dump(void);
+void mk2_split_link_reset(void);
+
+#else
+
+static inline void mk2_split_link_dump(void) {}
+static inline void mk2_split_link_reset(void) {}
+
+#endif /* CONFIG_MK2_SPLIT_LINK_STATS */
+
 #ifdef __cplusplus
 }
 #endif

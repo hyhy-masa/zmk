@@ -208,10 +208,24 @@ K_MSGQ_DEFINE(physical_layouts_kscan_msgq, sizeof(struct zmk_kscan_event),
 
 BUILD_ASSERT(MK2_KSCAN_HELD_LEN == 16, "[KGUARD] held= formatting expects a 16 byte bitmap");
 
+/* The queue must be able to hold everything one scan can produce.
+ *
+ * The producer (the scan work) and the consumer (msg_processor below) both run on the system
+ * work queue, which is serial: the consumer cannot be preempted mid-scan, and the scan cannot
+ * run again until the consumer has drained. So the deepest the queue can ever get is one
+ * scan's worth of edges, and one scan can at most report every key in the matrix changing at
+ * once. Sized above that, overflow is not merely unlikely - it is unreachable.
+ *
+ * This replaces an evict-the-oldest recovery that was wrong: the oldest queued edge is as
+ * likely to be a release as the newest, and dropping a release strands that key held forever
+ * - the exact defect being hunted. A recovery that can cause the fault is not a recovery.
+ * Making overflow impossible is the fix; the counters below stay as proof it never happens. */
+BUILD_ASSERT(CONFIG_ZMK_KSCAN_EVENT_QUEUE_SIZE > ZMK_MATRIX_ROWS * ZMK_MATRIX_COLS,
+             "kscan queue must exceed one scan's worth of edges, or a key release can be lost");
+
 enum mk2_kscan_loss_kind {
-    /* The oldest queued edge was sacrificed so the newest one survived: recovery fired. */
-    MK2_KSCAN_LOSS_EVICTED,
-    /* Nothing could be queued at all. This edge is gone for good. */
+    /* Nothing could be queued at all. Per the assert above this cannot happen; if the counter
+     * ever moves, the reasoning behind the assert is wrong and that is the finding. */
     MK2_KSCAN_LOSS_DROPPED,
 };
 
@@ -228,7 +242,6 @@ struct mk2_kscan_loss_rec {
 
 static struct mk2_kscan_loss_rec mk2_kscan_ring[MK2_KSCAN_LOSS_RING];
 static uint32_t mk2_kscan_ring_next;
-static uint32_t mk2_kscan_evicted_count;
 static uint32_t mk2_kscan_dropped_count;
 static uint32_t mk2_kscan_q_hwm;
 static uint32_t mk2_kscan_drain_last_ms;
@@ -250,6 +263,9 @@ static int32_t mk2_kscan_position_of(uint32_t row, uint32_t column) {
 static void mk2_kscan_note_loss(const struct zmk_kscan_event *ev, int err,
                                 enum mk2_kscan_loss_kind kind) {
     uint32_t now = k_uptime_get_32();
+    /* The reader runs on a different work queue, so a record written here can otherwise be
+     * printed half-updated - and a garbled record is worst exactly when it finally matters. */
+    unsigned int key = irq_lock();
     struct mk2_kscan_loss_rec *rec = &mk2_kscan_ring[mk2_kscan_ring_next % MK2_KSCAN_LOSS_RING];
 
     rec->ms = now;
@@ -259,12 +275,8 @@ static void mk2_kscan_note_loss(const struct zmk_kscan_event *ev, int err,
     rec->pressed = (ev->state == ZMK_KSCAN_EVENT_STATE_PRESSED) ? 1 : 0;
     rec->kind = (uint8_t)kind;
     mk2_kscan_ring_next++;
-
-    if (kind == MK2_KSCAN_LOSS_EVICTED) {
-        mk2_kscan_evicted_count++;
-    } else {
-        mk2_kscan_dropped_count++;
-    }
+    mk2_kscan_dropped_count++;
+    irq_unlock(key);
 }
 
 static void mk2_kscan_note_drain(void) {
@@ -304,23 +316,9 @@ static void mk2_kscan_enqueue(struct zmk_kscan_event *ev) {
         mk2_kscan_q_hwm = used;
     }
 
-    if (err == 0) {
-        return;
-    }
-
-    /* Full. Keep the newest edge, not the oldest. Losing a release leaves the key held for
-     * good; losing a press costs one character and cannot stick anything, because a release
-     * for a key the keymap never saw pressed is simply ignored. Same idiom as the HID send
-     * queue in hog.c. */
-    struct zmk_kscan_event discarded;
-
-    if (k_msgq_get(&physical_layouts_kscan_msgq, &discarded, K_NO_WAIT) == 0) {
-        int retry = k_msgq_put(&physical_layouts_kscan_msgq, ev, K_NO_WAIT);
-
-        mk2_kscan_note_loss(&discarded, 0, MK2_KSCAN_LOSS_EVICTED);
-        err = retry;
-    }
-
+    /* Nothing is sacrificed to make room - see the BUILD_ASSERT above for why there is always
+     * room. Recorded rather than discarded silently, so that if the impossible does happen it
+     * is a finding and not another invisible lost release. */
     if (err != 0) {
         mk2_kscan_note_loss(ev, err, MK2_KSCAN_LOSS_DROPPED);
     }
@@ -335,10 +333,11 @@ void mk2_kscan_stats_dump(void) {
 
     /* Split across several calls so no single one spills a large argument list onto the
      * stack of whichever work queue is doing the printing. */
-    printk("[KGUARD] half=%s dropped=%u evicted=%u hwm=%u/%u drain_max_gap_ms=%u up=%u\n",
+    printk("[KGUARD] half=%s dropped=%u hwm=%u/%u max_per_scan=%u drain_max_gap_ms=%u up=%u\n",
            IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL) ? "R" : "L", mk2_kscan_dropped_count,
-           mk2_kscan_evicted_count, mk2_kscan_q_hwm, (uint32_t)CONFIG_ZMK_KSCAN_EVENT_QUEUE_SIZE,
-           mk2_kscan_drain_max_gap_ms, k_uptime_get_32());
+           mk2_kscan_q_hwm, (uint32_t)CONFIG_ZMK_KSCAN_EVENT_QUEUE_SIZE,
+           (uint32_t)(ZMK_MATRIX_ROWS * ZMK_MATRIX_COLS), mk2_kscan_drain_max_gap_ms,
+           k_uptime_get_32());
     printk("[KGUARD] held=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
            held[0], held[1], held[2], held[3], held[4], held[5], held[6], held[7], held[8],
            held[9], held[10], held[11], held[12], held[13], held[14], held[15]);
@@ -350,10 +349,8 @@ void mk2_kscan_stats_dump(void) {
             &mk2_kscan_ring[(mk2_kscan_ring_next - 1 - i) % MK2_KSCAN_LOSS_RING];
 
         /* RELEASE is shouted because that is the case that sticks a key. */
-        printk("[KGUARD] lost[%u] pos=%d %s %s err=%d ms=%u idle_ms=%u\n", i, rec->position,
-               rec->pressed ? "press" : "RELEASE",
-               rec->kind == MK2_KSCAN_LOSS_EVICTED ? "evicted" : "dropped", rec->err, rec->ms,
-               rec->idle_ms);
+        printk("[KGUARD] lost[%u] pos=%d %s dropped err=%d ms=%u idle_ms=%u\n", i, rec->position,
+               rec->pressed ? "press" : "RELEASE", rec->err, rec->ms, rec->idle_ms);
     }
 }
 

@@ -220,8 +220,27 @@ BUILD_ASSERT(MK2_KSCAN_HELD_LEN == 16, "[KGUARD] held= formatting expects a 16 b
  * likely to be a release as the newest, and dropping a release strands that key held forever
  * - the exact defect being hunted. A recovery that can cause the fault is not a recovery.
  * Making overflow impossible is the fix; the counters below stay as proof it never happens. */
-BUILD_ASSERT(CONFIG_ZMK_KSCAN_EVENT_QUEUE_SIZE > ZMK_MATRIX_ROWS * ZMK_MATRIX_COLS,
+/* Taken from the kscan node rather than from zmk/matrix.h: ZMK_MATRIX_ROWS/COLS there are
+ * only defined for boards WITHOUT a zmk,physical-layout, and this one has one. Reading the
+ * layout's own kscan phandle also gives the matrix of THIS half, which is the number that
+ * matters - the shared transform covers both halves and would overstate it. */
+#define MK2_KSCAN_NODE DT_PHANDLE(DT_CHOSEN(zmk_physical_layout), kscan)
+
+#if DT_NODE_HAS_PROP(MK2_KSCAN_NODE, row_gpios) && DT_NODE_HAS_PROP(MK2_KSCAN_NODE, col_gpios)
+#define MK2_KSCAN_MAX_PER_SCAN                                                                     \
+    (DT_PROP_LEN(MK2_KSCAN_NODE, row_gpios) * DT_PROP_LEN(MK2_KSCAN_NODE, col_gpios))
+
+BUILD_ASSERT(CONFIG_ZMK_KSCAN_EVENT_QUEUE_SIZE > MK2_KSCAN_MAX_PER_SCAN,
              "kscan queue must exceed one scan's worth of edges, or a key release can be lost");
+#else
+
+/* Fail loud rather than quietly skip: the whole point of this block is that overflow is
+ * unreachable, and that claim rests on the assert above. Without it the counters would still
+ * tick but the guarantee would be gone, which reads exactly like a guarantee that holds. */
+#warning "MK2_KSCAN_DROP_STATS cannot prove the queue exceeds one scan: kscan is not a GPIO matrix"
+#define MK2_KSCAN_MAX_PER_SCAN 0
+
+#endif
 
 enum mk2_kscan_loss_kind {
     /* Nothing could be queued at all. Per the assert above this cannot happen; if the counter
@@ -336,8 +355,7 @@ void mk2_kscan_stats_dump(void) {
     printk("[KGUARD] half=%s dropped=%u hwm=%u/%u max_per_scan=%u drain_max_gap_ms=%u up=%u\n",
            IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL) ? "R" : "L", mk2_kscan_dropped_count,
            mk2_kscan_q_hwm, (uint32_t)CONFIG_ZMK_KSCAN_EVENT_QUEUE_SIZE,
-           (uint32_t)(ZMK_MATRIX_ROWS * ZMK_MATRIX_COLS), mk2_kscan_drain_max_gap_ms,
-           k_uptime_get_32());
+           (uint32_t)MK2_KSCAN_MAX_PER_SCAN, mk2_kscan_drain_max_gap_ms, k_uptime_get_32());
     printk("[KGUARD] held=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
            held[0], held[1], held[2], held[3], held[4], held[5], held[6], held[7], held[8],
            held[9], held[10], held[11], held[12], held[13], held[14], held[15]);

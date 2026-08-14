@@ -340,6 +340,49 @@ config MK2_SPLIT_NOTIFY_STATS_SELFTEST
       FAULT INJECTION - a skipped notification can leave a key or layer stuck
       exactly like the defect under investigation, so never ship this enabled.
 
+config MK2_KSCAN_DROP_STATS
+    bool "MK2: local kscan edge-loss statistics and evict-oldest recovery"
+    default n
+    depends on ZMK_KSCAN
+    help
+      The local key scan callback puts each press/release edge on a fixed-depth
+      queue with K_NO_WAIT and never looks at the result. A full queue therefore
+      discards the edge in silence, and the scan driver only reports transitions,
+      so a discarded release is never re-sent: that key stays held forever.
+
+      This path exists on BOTH halves and had no instrument of any kind. Every
+      counter built so far for the stuck-key hunt lives on the central and looks
+      only at events that arrived over the split link, so a loss here is invisible
+      to all of them - which is how a symptomatic session can report zero drops.
+
+      Two things are added. Recovery: when the queue is full the OLDEST queued
+      edge is evicted so the newest survives, because losing a release (key held
+      forever) is far worse than losing a press (one missing character). Same
+      idiom as the HID send queue in hog.c. Measurement: eviction and outright
+      loss are counted separately, the last eight events are kept with position,
+      press/release, error and how long the consumer had been idle, and the set
+      of positions this half believes are held is printed alongside. If that set
+      shows a key down that the fingers have released, the fault is at or before
+      key scanning, not on the split link.
+
+      Read out as [KGUARD] - through the [MK2_DIAG] footer on the central, and
+      through the periodic [NGUARD] dump on the peripheral.
+
+config MK2_BLE_DIAG_AUTO_DUMP_MS
+    int "MK2: automatic [MK2_DIAG] footer interval in ms (0 = manual key only)"
+    default 0
+    range 0 3600000
+    depends on MK2_BLE_DIAG
+    help
+      Prints the whole diagnostic footer on a timer instead of only when the DUMP
+      key is pressed. The manual key cannot capture the symptom under study: the
+      DUMP binding lives on the left half, and the fault being chased is the left
+      half becoming unable to send key events. Three captures were lost that way.
+
+      Zero keeps the previous manual-only behavior. Any non-zero value still
+      prints nothing unless a host has the console open with DTR asserted, so a
+      keyboard in normal use is unaffected.
+
 config ZMK_BLE_CLEAR_BONDS_ON_START
     bool "Configuration that clears all bond information from the keyboard on startup."
 

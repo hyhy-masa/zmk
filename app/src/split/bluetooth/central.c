@@ -149,32 +149,128 @@ static bool is_enabled;
 #warning "MK2_SPLIT_POS_DROP_SELFTEST is a fault injection build that can stick keys - bench only, do not ship"
 #endif
 
+#define MK2_SPLIT_LOSS_RING 8
+
+enum mk2_split_loss_kind {
+    /* Oldest queued edge sacrificed so the newest survived: recovery fired. */
+    MK2_SPLIT_LOSS_EVICTED,
+    /* Nothing could be queued, but the XOR state was rolled back so the next snapshot
+     * from the peripheral regenerates the edge. */
+    MK2_SPLIT_LOSS_ROLLED_BACK,
+    /* Lost during slot release. The state is zeroed immediately afterwards, so unlike the
+     * case above there is nothing left to regenerate it from. */
+    MK2_SPLIT_LOSS_ON_DISCONNECT,
+};
+
+struct mk2_split_loss_rec {
+    uint32_t ms;
+    /* How long the consumer had been idle when this edge was lost. Large means the system
+     * work queue was stalled, small means a genuine burst arrived. */
+    uint32_t idle_ms;
+    uint32_t position;
+    int16_t err;
+    uint8_t pressed;
+    uint8_t kind;
+};
+
+static struct mk2_split_loss_rec split_pos_loss_ring[MK2_SPLIT_LOSS_RING];
+static uint32_t split_pos_loss_next;
 static uint32_t split_pos_drop_count;
+static uint32_t split_pos_evicted_count;
 static uint32_t split_pos_drop_max_q;
-static uint32_t split_pos_drop_last_pos;
-static uint32_t split_pos_drop_last_up_ms;
+static uint32_t split_pos_drain_last_ms;
+static uint32_t split_pos_drain_max_gap_ms;
 
 #if CONFIG_MK2_SPLIT_POS_DROP_SELFTEST > 0
 static uint32_t split_pos_drop_selftest_attempt;
 #endif
 
+static void mk2_split_pos_note_loss(uint32_t position, bool pressed, int err,
+                                    enum mk2_split_loss_kind kind) {
+    uint32_t now = k_uptime_get_32();
+    struct mk2_split_loss_rec *rec = &split_pos_loss_ring[split_pos_loss_next % MK2_SPLIT_LOSS_RING];
+
+    rec->ms = now;
+    rec->idle_ms = (split_pos_drain_last_ms == 0) ? 0 : (now - split_pos_drain_last_ms);
+    rec->position = position;
+    rec->err = (int16_t)err;
+    rec->pressed = pressed ? 1 : 0;
+    rec->kind = (uint8_t)kind;
+    split_pos_loss_next++;
+
+    if (kind == MK2_SPLIT_LOSS_EVICTED) {
+        split_pos_evicted_count++;
+    } else {
+        split_pos_drop_count++;
+    }
+}
+
+static void mk2_split_pos_note_drain(void) {
+    uint32_t now = k_uptime_get_32();
+
+    if (split_pos_drain_last_ms != 0) {
+        uint32_t gap = now - split_pos_drain_last_ms;
+
+        if (gap > split_pos_drain_max_gap_ms) {
+            split_pos_drain_max_gap_ms = gap;
+        }
+    }
+
+    split_pos_drain_last_ms = now;
+}
+
+static void mk2_split_pos_note_queue(uint32_t used) {
+    /* Sampled on every event, not just on failure: after a failed put the queue is by
+     * definition full, so sampling only there would pin max_q to the queue size and tell us
+     * nothing about the normal headroom. */
+    if (used > split_pos_drop_max_q) {
+        split_pos_drop_max_q = used;
+    }
+}
+
 void mk2_split_pos_drop_dump(void) {
     /* now_ms closes the measurement window: without it a drop count cannot be told
      * apart from a stale one, and no rate can be derived. */
-    printk("[MK2_DIAG] split_pos_drop=%u,max_q=%u,last_pos=%u,last_up_ms=%u,now_ms=%u\n",
-           split_pos_drop_count, split_pos_drop_max_q, split_pos_drop_last_pos,
-           split_pos_drop_last_up_ms, k_uptime_get_32());
+    printk("[MK2_DIAG] split_pos_drop=%u,evicted=%u,max_q=%u/%u,drain_max_gap_ms=%u,"
+           "since=boot,now_ms=%u\n",
+           split_pos_drop_count, split_pos_evicted_count, split_pos_drop_max_q,
+           (uint32_t)CONFIG_ZMK_SPLIT_BLE_CENTRAL_POSITION_QUEUE_SIZE, split_pos_drain_max_gap_ms,
+           k_uptime_get_32());
+
+    uint32_t shown = MIN(split_pos_loss_next, (uint32_t)MK2_SPLIT_LOSS_RING);
+
+    for (uint32_t i = 0; i < shown; i++) {
+        const struct mk2_split_loss_rec *rec =
+            &split_pos_loss_ring[(split_pos_loss_next - 1 - i) % MK2_SPLIT_LOSS_RING];
+        static const char *const kind_name[] = {"evicted", "rolled_back", "on_disconnect"};
+
+        /* RELEASE is shouted because that is the case that sticks a key. */
+        printk("[MK2_DIAG] split_lost[%u] pos=%u %s %s err=%d ms=%u idle_ms=%u\n", i,
+               rec->position, rec->pressed ? "press" : "RELEASE",
+               kind_name[rec->kind <= MK2_SPLIT_LOSS_ON_DISCONNECT ? rec->kind : 0], rec->err,
+               rec->ms, rec->idle_ms);
+    }
 }
 
-/* Called from mk2_ble_diag_reset() so these counters share the measurement window with
- * the mk2_diag_* counters. Without this, a DLOG_CLEAR -> use -> DLOG_DUMP cycle would
- * print a windowed number next to a since-boot number and the two could not be compared. */
-void mk2_split_pos_drop_reset(void) {
-    split_pos_drop_count = 0;
-    split_pos_drop_max_q = 0;
-    split_pos_drop_last_pos = 0;
-    split_pos_drop_last_up_ms = 0;
-}
+/* Deliberately does nothing.
+ *
+ * These counters used to be cleared from mk2_ble_diag_reset() so they would share a window
+ * with the BLE pipe counters. That cost more than it bought: the events being counted here
+ * are rare and can predate any window the operator happens to open, and a zero from a
+ * cleared counter is indistinguishable from a zero that means "this never happened". The
+ * whole [SPLINK] instrument was read as broken for a day on exactly that confusion. The
+ * dump prints since=boot so the reader is never left guessing which it is. */
+void mk2_split_pos_drop_reset(void) {}
+
+#else /* !CONFIG_MK2_SPLIT_POS_DROP_STATS */
+
+static inline void mk2_split_pos_note_loss(uint32_t position, bool pressed, int err, int kind) {}
+static inline void mk2_split_pos_note_drain(void) {}
+static inline void mk2_split_pos_note_queue(uint32_t used) {}
+
+#define MK2_SPLIT_LOSS_EVICTED 0
+#define MK2_SPLIT_LOSS_ROLLED_BACK 1
+#define MK2_SPLIT_LOSS_ON_DISCONNECT 2
 
 #endif /* CONFIG_MK2_SPLIT_POS_DROP_STATS */
 
@@ -205,22 +301,24 @@ static uint32_t split_link_last_conn_ms;
  * separates them. */
 static uint32_t split_link_min_gap_ms;
 
+/* Answered from the peripheral slot table, not from the connect callback, so the readout does
+ * not depend on the very callback whose wiring is in question. A day went into reading
+ * "conn=0" as "the link never came up" when the truth was that the counter had never been
+ * reached at all; linked= is the independent axis that tells those two apart at a glance. */
+static uint32_t mk2_split_link_connected_slots(void);
+
 void mk2_split_link_dump(void) {
-    printk("[SPLINK] disc=%u conn=%u last_reason=0x%02x last_disc_ms=%u last_conn_ms=%u "
-           "min_gap_ms=%u now_ms=%u\n",
-           split_link_disc_count, split_link_conn_count, split_link_last_reason,
-           split_link_last_disc_ms, split_link_last_conn_ms, split_link_min_gap_ms,
-           k_uptime_get_32());
+    printk("[SPLINK] linked=%u disc=%u conn=%u last_reason=0x%02x last_disc_ms=%u "
+           "last_conn_ms=%u min_gap_ms=%u since=boot now_ms=%u\n",
+           mk2_split_link_connected_slots(), split_link_disc_count, split_link_conn_count,
+           split_link_last_reason, split_link_last_disc_ms, split_link_last_conn_ms,
+           split_link_min_gap_ms, k_uptime_get_32());
 }
 
-void mk2_split_link_reset(void) {
-    split_link_disc_count = 0;
-    split_link_conn_count = 0;
-    split_link_last_reason = 0;
-    split_link_last_disc_ms = 0;
-    split_link_last_conn_ms = 0;
-    split_link_min_gap_ms = 0;
-}
+/* Deliberately does nothing - see mk2_split_pos_drop_reset(). A link comes up once at boot
+ * and stays up, so clearing this on DLOG_CLEAR guaranteed a zero no matter what the link had
+ * actually done. */
+void mk2_split_link_reset(void) {}
 
 static void mk2_split_link_note_disconnect(uint8_t reason) {
     split_link_disc_count++;
@@ -249,6 +347,22 @@ static void mk2_split_link_note_connect(void) {
 
 static struct peripheral_slot peripherals[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
 
+#if IS_ENABLED(CONFIG_MK2_SPLIT_LINK_STATS)
+
+static uint32_t mk2_split_link_connected_slots(void) {
+    uint32_t connected = 0;
+
+    for (int i = 0; i < ZMK_SPLIT_BLE_PERIPHERAL_COUNT; i++) {
+        if (peripherals[i].state == PERIPHERAL_SLOT_STATE_CONNECTED) {
+            connected++;
+        }
+    }
+
+    return connected;
+}
+
+#endif /* CONFIG_MK2_SPLIT_LINK_STATS */
+
 static bool is_scanning = false;
 
 static const struct bt_uuid_128 split_service_uuid = BT_UUID_INIT_128(ZMK_SPLIT_BT_SERVICE_UUID);
@@ -264,6 +378,53 @@ K_MSGQ_DEFINE(peripheral_event_msgq, sizeof(struct peripheral_event_wrapper),
 void peripheral_event_work_callback(struct k_work *work);
 
 K_WORK_DEFINE(peripheral_event_work, peripheral_event_work_callback);
+
+/* Sentinel for an evicted event that was not a key edge (battery, sensor, input). Printed as
+ * a position so the reader can see at a glance that no key was harmed. */
+#define MK2_SPLIT_POS_NOT_A_KEY 0xFFFFU
+
+/* Hands one peripheral event to the consumer, and returns the put result.
+ *
+ * The caller has already committed the peripheral's new position state by the time this runs,
+ * so an edge lost here cannot be rebuilt from a later snapshot: the XOR against the committed
+ * state comes out zero and nothing fires again. A lost release leaves that key held for good,
+ * which is what the host then turns into a stream of repeats.
+ *
+ * When the queue is full the OLDEST event is evicted so the newest survives, because the
+ * newest is the one most likely to be the release that ends a hold. Callers deal with the
+ * remaining case, where even that is not enough.
+ *
+ * The evicted event is not itself recoverable - its bit was committed too, and rolling it
+ * back could contradict a newer edge for the same position that is still in the queue. It is
+ * recorded instead. With a queue this deep an eviction should not happen at all, so if the
+ * readout ever shows one, that is a finding rather than routine wear. */
+static int split_enqueue_peripheral_event(struct peripheral_event_wrapper *ev) {
+    int err = k_msgq_put(&peripheral_event_msgq, ev, K_NO_WAIT);
+
+    mk2_split_pos_note_queue(k_msgq_num_used_get(&peripheral_event_msgq));
+
+    if (err != 0) {
+        struct peripheral_event_wrapper discarded;
+
+        if (k_msgq_get(&peripheral_event_msgq, &discarded, K_NO_WAIT) == 0) {
+            uint32_t lost_pos = MK2_SPLIT_POS_NOT_A_KEY;
+            bool lost_pressed = false;
+
+            if (discarded.event.type ==
+                ZMK_SPLIT_TRANSPORT_PERIPHERAL_EVENT_TYPE_KEY_POSITION_EVENT) {
+                lost_pos = discarded.event.data.key_position_event.position;
+                lost_pressed = discarded.event.data.key_position_event.pressed;
+            }
+
+            err = k_msgq_put(&peripheral_event_msgq, ev, K_NO_WAIT);
+            mk2_split_pos_note_loss(lost_pos, lost_pressed, 0, MK2_SPLIT_LOSS_EVICTED);
+        }
+    }
+
+    k_work_submit(&peripheral_event_work);
+
+    return err;
+}
 
 int peripheral_slot_index_for_conn(struct bt_conn *conn) {
     for (int i = 0; i < ZMK_SPLIT_BLE_PERIPHERAL_COUNT; i++) {
@@ -316,8 +477,17 @@ int release_peripheral_slot(int index) {
                                            .pressed = false,
                                        }}}};
 
-                k_msgq_put(&peripheral_event_msgq, &ev, K_NO_WAIT);
-                k_work_submit(&peripheral_event_work);
+                /* These are the releases that stop the halves parting company from leaving
+                 * keys held. Losing one here is worse than losing one on the normal path:
+                 * position_state is zeroed a few lines below, so there is no earlier value
+                 * left to roll back to and nothing can regenerate the edge. Recorded under
+                 * its own kind for that reason. */
+                int put_err = split_enqueue_peripheral_event(&ev);
+
+                if (put_err != 0) {
+                    mk2_split_pos_note_loss(position, false, put_err,
+                                            MK2_SPLIT_LOSS_ON_DISCONNECT);
+                }
             }
         }
     }
@@ -630,7 +800,6 @@ static uint8_t split_central_notify_func(struct bt_conn *conn,
                                            .position = position,
                                            .pressed = pressed,
                                        }}}};
-#if IS_ENABLED(CONFIG_MK2_SPLIT_POS_DROP_STATS)
                 int put_err;
 
 #if CONFIG_MK2_SPLIT_POS_DROP_SELFTEST > 0
@@ -640,28 +809,28 @@ static uint8_t split_central_notify_func(struct bt_conn *conn,
                 if (split_pos_drop_selftest_attempt % CONFIG_MK2_SPLIT_POS_DROP_SELFTEST == 0) {
                     put_err = -ENOMSG;
                 } else {
-                    put_err = k_msgq_put(&peripheral_event_msgq, &ev, K_NO_WAIT);
+                    put_err = split_enqueue_peripheral_event(&ev);
                 }
 #else
-                put_err = k_msgq_put(&peripheral_event_msgq, &ev, K_NO_WAIT);
+                put_err = split_enqueue_peripheral_event(&ev);
 #endif
-                /* Sampled on every event, not just on failure: after a failed put the queue is
-                 * by definition full, so sampling only there would pin max_q to the queue size
-                 * and tell us nothing about the normal headroom. */
-                uint32_t queue_depth = k_msgq_num_used_get(&peripheral_event_msgq);
 
-                if (queue_depth > split_pos_drop_max_q) {
-                    split_pos_drop_max_q = queue_depth;
-                }
                 if (put_err != 0) {
-                    split_pos_drop_count++;
-                    split_pos_drop_last_pos = position;
-                    split_pos_drop_last_up_ms = k_uptime_get_32();
+                    /* Undo the commit for this one bit.
+                     *
+                     * The peripheral sends whole-state snapshots, so putting the previous
+                     * value back makes the next snapshot differ here again and the missing
+                     * edge is regenerated on the very next key event - rather than staying
+                     * lost until this particular key happens to move again.
+                     *
+                     * It is not free. If the edge that was lost was a press, its release will
+                     * now cancel against the restored bit and the whole tap disappears: one
+                     * character that never arrives. That is a much smaller fault than a key
+                     * that never comes back up, which is the trade being made here. */
+                    slot->position_state[i] ^= BIT(j);
+                    mk2_split_pos_note_loss(position, pressed, put_err,
+                                            MK2_SPLIT_LOSS_ROLLED_BACK);
                 }
-#else
-                k_msgq_put(&peripheral_event_msgq, &ev, K_NO_WAIT);
-#endif
-                k_work_submit(&peripheral_event_work);
             }
         }
     }
@@ -1599,6 +1768,13 @@ static int finish_init() {
 
 void peripheral_event_work_callback(struct k_work *work) {
     struct peripheral_event_wrapper ev;
+
+    /* Timestamped on entry so the gap between drains is measurable. This queue only fills
+     * when its consumer is not running, and the consumer is the shared system work queue -
+     * so the gap is the difference between "a burst arrived" and "something else was holding
+     * the work queue". Without it a drop count says nothing about why. */
+    mk2_split_pos_note_drain();
+
     while (k_msgq_get(&peripheral_event_msgq, &ev, K_NO_WAIT) == 0) {
         LOG_DBG("Trigger key position state change for %d",
                 ev.event.data.key_position_event.position);

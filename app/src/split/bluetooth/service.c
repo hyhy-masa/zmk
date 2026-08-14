@@ -35,6 +35,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/split/bluetooth/service.h>
 #if IS_ENABLED(CONFIG_MK2_SPLIT_NOTIFY_STATS)
 #include <zmk/workqueue.h>
+#include <zmk/mk2_kscan_stats.h>
 #endif
 
 #include "peripheral.h"
@@ -369,6 +370,11 @@ static void split_notify_stats_dump_callback(struct k_work *work) {
                state[0], state[1], state[2], state[3], state[4], state[5], state[6], state[7],
                state[8], state[9], state[10], state[11], state[12], state[13], state[14],
                state[15]);
+        /* Key scanning on this half, one layer earlier than pos= above. pos= is what the
+         * peripheral is willing to send; [KGUARD] held= is what its own scan queue actually
+         * delivered. When they disagree the edge died between the two, and when they agree
+         * but the fingers disagree with both, it died at or before the scan. */
+        mk2_kscan_stats_dump();
     }
 
     /* Rescheduled onto the low priority queue, never service_work_q: that queue is the one

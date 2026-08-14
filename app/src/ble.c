@@ -35,6 +35,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/hog.h>
 #include <zmk/mk2_ble_diag.h>
 #include <zmk/mk2_split_stats.h>
+#include <zmk/mk2_kscan_stats.h>
 #include <zmk/keys.h>
 #include <zmk/split/bluetooth/uuid.h>
 #include <zmk/event_manager.h>
@@ -653,7 +654,62 @@ void mk2_ble_diag_dump(void) {
            (uint16_t)atomic_get(&mk2_diag_timeout));
     mk2_split_pos_drop_dump();
     mk2_split_link_dump();
+    /* This half's own key scanning, last. The peripheral prints the same block from its
+     * [NGUARD] timer, so the two [KGUARD] lines can be laid side by side: whichever half
+     * shows a key held that the fingers have released is the half that lost the edge. */
+    mk2_kscan_stats_dump();
 }
+
+#if CONFIG_MK2_BLE_DIAG_AUTO_DUMP_MS > 0
+
+#include <zephyr/init.h>
+#include <zephyr/drivers/uart.h>
+#include <zmk/workqueue.h>
+
+#if DT_HAS_CHOSEN(zephyr_console) && DT_NODE_HAS_STATUS(DT_CHOSEN(zephyr_console), okay) &&        \
+    IS_ENABLED(CONFIG_UART_LINE_CTRL)
+
+/* The DUMP key cannot capture this fault.
+ *
+ * The binding sits on the left half, and the fault under investigation is the left half
+ * failing to deliver key events - so at the moment the reading is wanted, the key that takes
+ * it is the one that does not work. Three captures were lost to that before anyone noticed
+ * the shape of it. Asking the owner to press a key to measure a key that will not press was
+ * a design mistake; this replaces it. */
+static void mk2_ble_diag_auto_dump_callback(struct k_work *work) {
+    const struct device *dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+    uint32_t dtr = 0;
+
+    if (device_is_ready(dev) && uart_line_ctrl_get(dev, UART_LINE_CTRL_DTR, &dtr) == 0 && dtr) {
+        mk2_ble_diag_dump();
+    }
+
+    /* Low priority queue, never the one carrying key events: a console write blocking on the
+     * host must not add latency to the path being measured. */
+    k_work_reschedule_for_queue(zmk_workqueue_lowprio_work_q(), k_work_delayable_from_work(work),
+                                K_MSEC(CONFIG_MK2_BLE_DIAG_AUTO_DUMP_MS));
+}
+
+static K_WORK_DELAYABLE_DEFINE(mk2_ble_diag_auto_dump_work, mk2_ble_diag_auto_dump_callback);
+
+static int mk2_ble_diag_auto_dump_init(void) {
+    k_work_reschedule_for_queue(zmk_workqueue_lowprio_work_q(), &mk2_ble_diag_auto_dump_work,
+                                K_MSEC(CONFIG_MK2_BLE_DIAG_AUTO_DUMP_MS));
+    return 0;
+}
+
+SYS_INIT(mk2_ble_diag_auto_dump_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
+
+#else
+
+/* Fail loud rather than time out quietly: an interval was asked for, and without a
+ * DTR-capable console nothing would ever be printed - which reads exactly like a keyboard
+ * with nothing to report. */
+#warning "MK2_BLE_DIAG_AUTO_DUMP_MS is set but no DTR-capable console is chosen: nothing will be printed"
+
+#endif /* chosen console is present and okay && CONFIG_UART_LINE_CTRL */
+
+#endif /* CONFIG_MK2_BLE_DIAG_AUTO_DUMP_MS > 0 */
 
 #endif /* CONFIG_MK2_BLE_DIAG */
 

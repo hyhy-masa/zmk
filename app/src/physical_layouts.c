@@ -18,10 +18,16 @@
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
+#include <zephyr/kernel.h>
+#include <zephyr/sys/util.h>
+#include <zephyr/sys/printk.h>
+#include <string.h>
+
 #include <zmk/matrix.h>
 #include <zmk/physical_layouts.h>
 #include <zmk/event_manager.h>
 #include <zmk/events/position_state_changed.h>
+#include <zmk/mk2_kscan_stats.h>
 
 ZMK_EVENT_IMPL(zmk_physical_layout_selection_changed);
 
@@ -180,6 +186,188 @@ static struct zmk_kscan_msg_processor {
 K_MSGQ_DEFINE(physical_layouts_kscan_msgq, sizeof(struct zmk_kscan_event),
               CONFIG_ZMK_KSCAN_EVENT_QUEUE_SIZE, 4);
 
+#if IS_ENABLED(CONFIG_MK2_KSCAN_DROP_STATS)
+
+/* Local key-scan edge loss, on whichever half this build runs on.
+ *
+ * The producer runs in the scan driver's context; the consumer runs on the system work queue.
+ * Anything that stalls that queue backs this one up, and the original code passed the result
+ * of the put straight to the floor. A discarded release cannot be recovered: the scan driver
+ * reports transitions, not state, so nothing re-sends it and the key stays held.
+ *
+ * Every counter built for this hunt so far lives on the central and sees only events that
+ * already crossed the split link, so a loss here is invisible to all of them - which is how a
+ * session full of symptoms reported zero drops.
+ *
+ * Counters are since boot and are never cleared. The event that matters happens once, and a
+ * windowed counter erases it: that is exactly how the split link counters came to read as
+ * "no disconnects" while the link had in fact never been counted at all. */
+
+#define MK2_KSCAN_LOSS_RING 8
+#define MK2_KSCAN_HELD_LEN 16
+
+BUILD_ASSERT(MK2_KSCAN_HELD_LEN == 16, "[KGUARD] held= formatting expects a 16 byte bitmap");
+
+enum mk2_kscan_loss_kind {
+    /* The oldest queued edge was sacrificed so the newest one survived: recovery fired. */
+    MK2_KSCAN_LOSS_EVICTED,
+    /* Nothing could be queued at all. This edge is gone for good. */
+    MK2_KSCAN_LOSS_DROPPED,
+};
+
+struct mk2_kscan_loss_rec {
+    uint32_t ms;
+    /* How long the consumer had already been idle when this edge was lost. A large value
+     * means the system work queue was stalled; a small one means a genuine input burst. */
+    uint32_t idle_ms;
+    int32_t position;
+    int16_t err;
+    uint8_t pressed;
+    uint8_t kind;
+};
+
+static struct mk2_kscan_loss_rec mk2_kscan_ring[MK2_KSCAN_LOSS_RING];
+static uint32_t mk2_kscan_ring_next;
+static uint32_t mk2_kscan_evicted_count;
+static uint32_t mk2_kscan_dropped_count;
+static uint32_t mk2_kscan_q_hwm;
+static uint32_t mk2_kscan_drain_last_ms;
+static uint32_t mk2_kscan_drain_max_gap_ms;
+
+/* Positions this half has actually handed downstream as held. Held against what the fingers
+ * are doing, this is what separates "the edge never got through key scanning" from "the edge
+ * got through and something after it lost the key". */
+static uint8_t mk2_kscan_held[MK2_KSCAN_HELD_LEN];
+
+static int32_t mk2_kscan_position_of(uint32_t row, uint32_t column) {
+    if (active == NULL) {
+        return -1;
+    }
+
+    return zmk_matrix_transform_row_column_to_position(active->matrix_transform, row, column);
+}
+
+static void mk2_kscan_note_loss(const struct zmk_kscan_event *ev, int err,
+                                enum mk2_kscan_loss_kind kind) {
+    uint32_t now = k_uptime_get_32();
+    struct mk2_kscan_loss_rec *rec = &mk2_kscan_ring[mk2_kscan_ring_next % MK2_KSCAN_LOSS_RING];
+
+    rec->ms = now;
+    rec->idle_ms = (mk2_kscan_drain_last_ms == 0) ? 0 : (now - mk2_kscan_drain_last_ms);
+    rec->position = mk2_kscan_position_of(ev->row, ev->column);
+    rec->err = (int16_t)err;
+    rec->pressed = (ev->state == ZMK_KSCAN_EVENT_STATE_PRESSED) ? 1 : 0;
+    rec->kind = (uint8_t)kind;
+    mk2_kscan_ring_next++;
+
+    if (kind == MK2_KSCAN_LOSS_EVICTED) {
+        mk2_kscan_evicted_count++;
+    } else {
+        mk2_kscan_dropped_count++;
+    }
+}
+
+static void mk2_kscan_note_drain(void) {
+    uint32_t now = k_uptime_get_32();
+
+    if (mk2_kscan_drain_last_ms != 0) {
+        uint32_t gap = now - mk2_kscan_drain_last_ms;
+
+        if (gap > mk2_kscan_drain_max_gap_ms) {
+            mk2_kscan_drain_max_gap_ms = gap;
+        }
+    }
+
+    mk2_kscan_drain_last_ms = now;
+}
+
+static void mk2_kscan_note_delivered(int32_t position, bool pressed) {
+    if (position < 0 || position >= MK2_KSCAN_HELD_LEN * 8) {
+        return;
+    }
+
+    if (pressed) {
+        mk2_kscan_held[position / 8] |= BIT(position % 8);
+    } else {
+        mk2_kscan_held[position / 8] &= ~BIT(position % 8);
+    }
+}
+
+static void mk2_kscan_enqueue(struct zmk_kscan_event *ev) {
+    int err = k_msgq_put(&physical_layouts_kscan_msgq, ev, K_NO_WAIT);
+    uint32_t used = k_msgq_num_used_get(&physical_layouts_kscan_msgq);
+
+    /* Sampled on every edge rather than only on failure: after a failed put the queue is full
+     * by definition, so sampling there alone would pin the high water mark to the queue size
+     * and say nothing about the headroom in normal use. */
+    if (used > mk2_kscan_q_hwm) {
+        mk2_kscan_q_hwm = used;
+    }
+
+    if (err == 0) {
+        return;
+    }
+
+    /* Full. Keep the newest edge, not the oldest. Losing a release leaves the key held for
+     * good; losing a press costs one character and cannot stick anything, because a release
+     * for a key the keymap never saw pressed is simply ignored. Same idiom as the HID send
+     * queue in hog.c. */
+    struct zmk_kscan_event discarded;
+
+    if (k_msgq_get(&physical_layouts_kscan_msgq, &discarded, K_NO_WAIT) == 0) {
+        int retry = k_msgq_put(&physical_layouts_kscan_msgq, ev, K_NO_WAIT);
+
+        mk2_kscan_note_loss(&discarded, 0, MK2_KSCAN_LOSS_EVICTED);
+        err = retry;
+    }
+
+    if (err != 0) {
+        mk2_kscan_note_loss(ev, err, MK2_KSCAN_LOSS_DROPPED);
+    }
+}
+
+void mk2_kscan_stats_dump(void) {
+    uint8_t held[MK2_KSCAN_HELD_LEN];
+    unsigned int key = irq_lock();
+
+    memcpy(held, mk2_kscan_held, sizeof(held));
+    irq_unlock(key);
+
+    /* Split across several calls so no single one spills a large argument list onto the
+     * stack of whichever work queue is doing the printing. */
+    printk("[KGUARD] half=%s dropped=%u evicted=%u hwm=%u/%u drain_max_gap_ms=%u up=%u\n",
+           IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL) ? "R" : "L", mk2_kscan_dropped_count,
+           mk2_kscan_evicted_count, mk2_kscan_q_hwm, (uint32_t)CONFIG_ZMK_KSCAN_EVENT_QUEUE_SIZE,
+           mk2_kscan_drain_max_gap_ms, k_uptime_get_32());
+    printk("[KGUARD] held=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+           held[0], held[1], held[2], held[3], held[4], held[5], held[6], held[7], held[8],
+           held[9], held[10], held[11], held[12], held[13], held[14], held[15]);
+
+    uint32_t shown = MIN(mk2_kscan_ring_next, (uint32_t)MK2_KSCAN_LOSS_RING);
+
+    for (uint32_t i = 0; i < shown; i++) {
+        const struct mk2_kscan_loss_rec *rec =
+            &mk2_kscan_ring[(mk2_kscan_ring_next - 1 - i) % MK2_KSCAN_LOSS_RING];
+
+        /* RELEASE is shouted because that is the case that sticks a key. */
+        printk("[KGUARD] lost[%u] pos=%d %s %s err=%d ms=%u idle_ms=%u\n", i, rec->position,
+               rec->pressed ? "press" : "RELEASE",
+               rec->kind == MK2_KSCAN_LOSS_EVICTED ? "evicted" : "dropped", rec->err, rec->ms,
+               rec->idle_ms);
+    }
+}
+
+#else /* !CONFIG_MK2_KSCAN_DROP_STATS */
+
+static inline void mk2_kscan_enqueue(struct zmk_kscan_event *ev) {
+    k_msgq_put(&physical_layouts_kscan_msgq, ev, K_NO_WAIT);
+}
+
+static inline void mk2_kscan_note_drain(void) {}
+static inline void mk2_kscan_note_delivered(int32_t position, bool pressed) {}
+
+#endif /* CONFIG_MK2_KSCAN_DROP_STATS */
+
 static void zmk_physical_layout_kscan_callback(const struct device *dev, uint32_t row,
                                                uint32_t column, bool pressed) {
     if (dev != active->kscan) {
@@ -191,12 +379,14 @@ static void zmk_physical_layout_kscan_callback(const struct device *dev, uint32_
         .column = column,
         .state = (pressed ? ZMK_KSCAN_EVENT_STATE_PRESSED : ZMK_KSCAN_EVENT_STATE_RELEASED)};
 
-    k_msgq_put(&physical_layouts_kscan_msgq, &ev, K_NO_WAIT);
+    mk2_kscan_enqueue(&ev);
     k_work_submit(&msg_processor.work);
 }
 
 static void zmk_physical_layouts_kscan_process_msgq(struct k_work *item) {
     struct zmk_kscan_event ev;
+
+    mk2_kscan_note_drain();
 
     while (k_msgq_get(&physical_layouts_kscan_msgq, &ev, K_NO_WAIT) == 0) {
         bool pressed = (ev.state == ZMK_KSCAN_EVENT_STATE_PRESSED);
@@ -211,6 +401,7 @@ static void zmk_physical_layouts_kscan_process_msgq(struct k_work *item) {
 
         LOG_DBG("Row: %d, col: %d, position: %d, pressed: %s", ev.row, ev.column, position,
                 (pressed ? "true" : "false"));
+        mk2_kscan_note_delivered(position, pressed);
         raise_zmk_position_state_changed(
             (struct zmk_position_state_changed){.source = ZMK_POSITION_STATE_CHANGE_SOURCE_LOCAL,
                                                 .state = pressed,

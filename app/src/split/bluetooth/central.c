@@ -396,11 +396,11 @@ static const struct bt_uuid_128 split_service_uuid = BT_UUID_INIT_128(ZMK_SPLIT_
 struct peripheral_event_wrapper {
     uint8_t source;
     struct zmk_split_transport_peripheral_event event;
-#if IS_ENABLED(CONFIG_MK2_SPLIT_POS_DROP_STATS)
     /* Set when the event is queued; the consumer subtracts it. A stall on this side loses
-     * nothing for a drop counter to see, so the wait is the only trace it leaves. */
+     * nothing for a drop counter to see, so the wait is the only trace it leaves.
+     * Unconditional for the same reason as the kscan event above: a member that exists in
+     * only some configurations breaks the builds that do not enable them. */
     uint32_t queued_ms;
-#endif
 };
 
 K_MSGQ_DEFINE(peripheral_event_msgq, sizeof(struct peripheral_event_wrapper),
@@ -425,9 +425,7 @@ K_WORK_DEFINE(peripheral_event_work, peripheral_event_work_callback);
  * strand a key held forever, which is the exact defect being hunted. Failing the put instead
  * leaves the newest edge in the caller's hands, where it can be undone. */
 static int split_enqueue_peripheral_event(struct peripheral_event_wrapper *ev) {
-#if IS_ENABLED(CONFIG_MK2_SPLIT_POS_DROP_STATS)
     ev->queued_ms = k_uptime_get_32();
-#endif
     int err = k_msgq_put(&peripheral_event_msgq, ev, K_NO_WAIT);
 
     mk2_split_pos_note_queue(k_msgq_num_used_get(&peripheral_event_msgq));

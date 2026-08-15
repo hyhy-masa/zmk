@@ -19,8 +19,14 @@ extern "C" {
 void mk2_kscan_stats_dump(void);
 
 /* Lives in the matrix driver rather than here: only the driver knows whether a scan
- * completed, and a scan that stops produces nothing for any counter above it to see. */
+ * completed, and a scan that stops produces nothing for any counter above it to see.
+ * Guarded on the driver actually being built - a declaration without a definition would
+ * link-fail on any board scanning some other way. */
+#if IS_ENABLED(CONFIG_ZMK_KSCAN_GPIO_MATRIX)
 void mk2_kscan_matrix_stats_dump(void);
+#else
+static inline void mk2_kscan_matrix_stats_dump(void) {}
+#endif
 
 #else
 

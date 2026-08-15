@@ -177,12 +177,16 @@ struct zmk_kscan_event {
     uint32_t row;
     uint32_t column;
     uint32_t state;
-#if IS_ENABLED(CONFIG_MK2_KSCAN_DROP_STATS)
     /* When this edge was handed to the queue. The consumer subtracts it to find out how long
      * the key path was unable to run - the one thing a stall leaves behind, since a stall
-     * loses nothing for a drop counter to notice. */
+     * loses nothing for a drop counter to notice.
+     *
+     * Present unconditionally, four bytes, even in builds that never read it. Hiding it
+     * behind the config meant the field vanished while the code that reads it did not, and
+     * the settings_reset target - which does not enable the counters - failed to compile.
+     * A struct member that exists in only some configurations is a trap for every future
+     * reader of this queue. */
     uint32_t queued_ms;
-#endif
 };
 
 static struct zmk_kscan_msg_processor {
@@ -440,9 +444,7 @@ static void zmk_physical_layout_kscan_callback(const struct device *dev, uint32_
         .row = row,
         .column = column,
         .state = (pressed ? ZMK_KSCAN_EVENT_STATE_PRESSED : ZMK_KSCAN_EVENT_STATE_RELEASED),
-#if IS_ENABLED(CONFIG_MK2_KSCAN_DROP_STATS)
         .queued_ms = k_uptime_get_32(),
-#endif
     };
 
     mk2_kscan_enqueue(&ev);

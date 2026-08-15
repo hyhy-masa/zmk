@@ -18,9 +18,14 @@ extern "C" {
  * reports from both halves and the two readouts can be compared side by side. */
 void mk2_kscan_stats_dump(void);
 
+/* Lives in the matrix driver rather than here: only the driver knows whether a scan
+ * completed, and a scan that stops produces nothing for any counter above it to see. */
+void mk2_kscan_matrix_stats_dump(void);
+
 #else
 
 static inline void mk2_kscan_stats_dump(void) {}
+static inline void mk2_kscan_matrix_stats_dump(void) {}
 
 #endif /* CONFIG_MK2_KSCAN_DROP_STATS */
 

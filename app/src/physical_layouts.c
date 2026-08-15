@@ -177,6 +177,12 @@ struct zmk_kscan_event {
     uint32_t row;
     uint32_t column;
     uint32_t state;
+#if IS_ENABLED(CONFIG_MK2_KSCAN_DROP_STATS)
+    /* When this edge was handed to the queue. The consumer subtracts it to find out how long
+     * the key path was unable to run - the one thing a stall leaves behind, since a stall
+     * loses nothing for a drop counter to notice. */
+    uint32_t queued_ms;
+#endif
 };
 
 static struct zmk_kscan_msg_processor {
@@ -264,7 +270,10 @@ static uint32_t mk2_kscan_ring_next;
 static uint32_t mk2_kscan_dropped_count;
 static uint32_t mk2_kscan_q_hwm;
 static uint32_t mk2_kscan_drain_last_ms;
-static uint32_t mk2_kscan_drain_max_gap_ms;
+/* When this half last produced a key edge. If typing stopped at a wall-clock moment the
+ * operator can name and this sits well before it, the scan itself died - a case the loss
+ * counters cannot see because a dead scan reports nothing to lose. */
+static uint32_t mk2_kscan_last_edge_ms;
 
 /* Positions this half has actually handed downstream as held. Held against what the fingers
  * are doing, this is what separates "the edge never got through key scanning" from "the edge
@@ -298,18 +307,43 @@ static void mk2_kscan_note_loss(const struct zmk_kscan_event *ev, int err,
     irq_unlock(key);
 }
 
-static void mk2_kscan_note_drain(void) {
+static void mk2_kscan_note_drain(void) { mk2_kscan_drain_last_ms = k_uptime_get_32(); }
+
+/* ── how long a key event waited before anything ran ──
+ *
+ * The reported symptom changed shape: "it stops as if the connection dropped", not "a key
+ * stays down". Everything built so far counts events that were LOST, and a stall loses
+ * nothing - it just arrives late. The counters read clean straight through the event, which
+ * is exactly what they did.
+ *
+ * The gap between drains cannot answer it: the consumer only runs when there is work, so an
+ * idle night registers as an eight-hour gap. That number measured the operator's sleep.
+ *
+ * A periodic heartbeat on the system work queue was written first and then withdrawn. It
+ * would have worked, but it wakes a battery-powered board twice a second forever, and an
+ * instrument that changes the power and scheduling behaviour of the thing it is watching can
+ * move the very symptom being hunted. Paying that price permanently, to measure something
+ * that only matters while someone is typing, is a bad trade.
+ *
+ * Each edge carries the time it was queued instead. The consumer subtracts it, and the
+ * worst case IS the time that keystroke sat waiting - measured on the real path, only while
+ * there is real typing, with no extra wakeups at all. */
+static uint32_t mk2_kscan_max_wait_ms;
+static uint32_t mk2_kscan_max_wait_at_ms;
+static uint32_t mk2_kscan_max_wait_pos;
+
+static void mk2_kscan_note_wait(uint32_t queued_ms, int32_t position) {
     uint32_t now = k_uptime_get_32();
+    uint32_t waited = now - queued_ms;
 
-    if (mk2_kscan_drain_last_ms != 0) {
-        uint32_t gap = now - mk2_kscan_drain_last_ms;
-
-        if (gap > mk2_kscan_drain_max_gap_ms) {
-            mk2_kscan_drain_max_gap_ms = gap;
-        }
+    if (waited > mk2_kscan_max_wait_ms) {
+        mk2_kscan_max_wait_ms = waited;
+        /* The moment it was finally serviced, not the moment it stalled: the stall started
+         * `waited` ms earlier, and saying so avoids the reader placing it wrongly against a
+         * wall clock. */
+        mk2_kscan_max_wait_at_ms = now;
+        mk2_kscan_max_wait_pos = (uint32_t)position;
     }
-
-    mk2_kscan_drain_last_ms = now;
 }
 
 static void mk2_kscan_note_delivered(int32_t position, bool pressed) {
@@ -327,6 +361,8 @@ static void mk2_kscan_note_delivered(int32_t position, bool pressed) {
 static void mk2_kscan_enqueue(struct zmk_kscan_event *ev) {
     int err = k_msgq_put(&physical_layouts_kscan_msgq, ev, K_NO_WAIT);
     uint32_t used = k_msgq_num_used_get(&physical_layouts_kscan_msgq);
+
+    mk2_kscan_last_edge_ms = k_uptime_get_32();
 
     /* Sampled on every edge rather than only on failure: after a failed put the queue is full
      * by definition, so sampling there alone would pin the high water mark to the queue size
@@ -352,10 +388,20 @@ void mk2_kscan_stats_dump(void) {
 
     /* Split across several calls so no single one spills a large argument list onto the
      * stack of whichever work queue is doing the printing. */
-    printk("[KGUARD] half=%s dropped=%u hwm=%u/%u max_per_scan=%u drain_max_gap_ms=%u up=%u\n",
+    /* max_wait_ms is the headline number for a stall: the longest a decoded key edge sat in
+     * the queue before anything ran. Normal is single-digit milliseconds. served_at is when
+     * it was finally handled, so the stall itself began max_wait_ms earlier - stated that way
+     * because the obvious reading of a bare timestamp is the wrong one.
+     *
+     * last_edge_ms cannot tell a dead scan from an idle keyboard on its own; it is read
+     * against a moment the operator can name. [MSCAN] below is what separates those two. */
+    printk("[KGUARD] half=%s dropped=%u hwm=%u/%u max_per_scan=%u max_wait_ms=%u@pos%u "
+           "served_at=%u last_edge_ms=%u up=%u\n",
            IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL) ? "R" : "L", mk2_kscan_dropped_count,
            mk2_kscan_q_hwm, (uint32_t)CONFIG_ZMK_KSCAN_EVENT_QUEUE_SIZE,
-           (uint32_t)MK2_KSCAN_MAX_PER_SCAN, mk2_kscan_drain_max_gap_ms, k_uptime_get_32());
+           (uint32_t)MK2_KSCAN_MAX_PER_SCAN, mk2_kscan_max_wait_ms, mk2_kscan_max_wait_pos,
+           mk2_kscan_max_wait_at_ms, mk2_kscan_last_edge_ms, k_uptime_get_32());
+    mk2_kscan_matrix_stats_dump();
     printk("[KGUARD] held=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
            held[0], held[1], held[2], held[3], held[4], held[5], held[6], held[7], held[8],
            held[9], held[10], held[11], held[12], held[13], held[14], held[15]);
@@ -380,6 +426,7 @@ static inline void mk2_kscan_enqueue(struct zmk_kscan_event *ev) {
 
 static inline void mk2_kscan_note_drain(void) {}
 static inline void mk2_kscan_note_delivered(int32_t position, bool pressed) {}
+static inline void mk2_kscan_note_wait(uint32_t queued_ms, int32_t position) {}
 
 #endif /* CONFIG_MK2_KSCAN_DROP_STATS */
 
@@ -392,7 +439,11 @@ static void zmk_physical_layout_kscan_callback(const struct device *dev, uint32_
     struct zmk_kscan_event ev = {
         .row = row,
         .column = column,
-        .state = (pressed ? ZMK_KSCAN_EVENT_STATE_PRESSED : ZMK_KSCAN_EVENT_STATE_RELEASED)};
+        .state = (pressed ? ZMK_KSCAN_EVENT_STATE_PRESSED : ZMK_KSCAN_EVENT_STATE_RELEASED),
+#if IS_ENABLED(CONFIG_MK2_KSCAN_DROP_STATS)
+        .queued_ms = k_uptime_get_32(),
+#endif
+    };
 
     mk2_kscan_enqueue(&ev);
     k_work_submit(&msg_processor.work);
@@ -416,6 +467,7 @@ static void zmk_physical_layouts_kscan_process_msgq(struct k_work *item) {
 
         LOG_DBG("Row: %d, col: %d, position: %d, pressed: %s", ev.row, ev.column, position,
                 (pressed ? "true" : "false"));
+        mk2_kscan_note_wait(ev.queued_ms, position);
         mk2_kscan_note_delivered(position, pressed);
         raise_zmk_position_state_changed(
             (struct zmk_position_state_changed){.source = ZMK_POSITION_STATE_CHANGE_SOURCE_LOCAL,

@@ -14,6 +14,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/__assert.h>
+#include <zephyr/sys/printk.h>
 #include <zephyr/sys/util.h>
 
 #include <zmk/debounce.h>
@@ -215,6 +216,52 @@ static void kscan_matrix_read_end(const struct device *dev) {
 #endif
 }
 
+#if IS_ENABLED(CONFIG_MK2_KSCAN_DROP_STATS)
+
+/* ── whether the scan is still alive ──
+ *
+ * kscan_matrix_read() returns early on any GPIO failure, and the work handler below throws
+ * that return value away without rescheduling or re-arming the interrupts. The scan simply
+ * stops. Nothing else stops with it: the system work queue keeps running, no event is
+ * dropped because none is produced, and every counter downstream stays at zero. On a readout
+ * it is indistinguishable from a keyboard nobody is touching - which is exactly what "it
+ * stops as if the connection dropped" would look like from here.
+ *
+ * These four numbers separate those two cases. If ok keeps climbing, the scan is alive and
+ * the fault is downstream. If it stopped climbing at last_ok_ms, the scan died - and err
+ * with last_err says whether a GPIO error killed it.
+ */
+static uint32_t mk2_scan_ok_count;
+static uint32_t mk2_scan_err_count;
+static uint32_t mk2_scan_last_ok_ms;
+static uint32_t mk2_scan_last_err_ms;
+static int mk2_scan_last_err;
+
+void mk2_kscan_matrix_stats_dump(void) {
+    printk("[MSCAN] ok=%u err=%u last_err=%d last_ok_ms=%u last_err_ms=%u now_ms=%u\n",
+           mk2_scan_ok_count, mk2_scan_err_count, mk2_scan_last_err, mk2_scan_last_ok_ms,
+           mk2_scan_last_err_ms, k_uptime_get_32());
+}
+
+static void mk2_scan_note(int err) {
+    uint32_t now = k_uptime_get_32();
+
+    if (err == 0) {
+        mk2_scan_ok_count++;
+        mk2_scan_last_ok_ms = now;
+    } else {
+        mk2_scan_err_count++;
+        mk2_scan_last_err = err;
+        mk2_scan_last_err_ms = now;
+    }
+}
+
+#else
+
+static inline void mk2_scan_note(int err) {}
+
+#endif /* CONFIG_MK2_KSCAN_DROP_STATS */
+
 static int kscan_matrix_read(const struct device *dev) {
     struct kscan_matrix_data *data = dev->data;
     const struct kscan_matrix_config *config = dev->config;
@@ -293,7 +340,10 @@ static int kscan_matrix_read(const struct device *dev) {
 static void kscan_matrix_work_handler(struct k_work *work) {
     struct k_work_delayable *dwork = k_work_delayable_from_work(work);
     struct kscan_matrix_data *data = CONTAINER_OF(dwork, struct kscan_matrix_data, work);
-    kscan_matrix_read(data->dev);
+    /* The return value is still discarded - recovering from a failed scan is a behaviour
+     * change and this build is here to observe, not to fix. It is recorded now, which is the
+     * difference between a scan that died and a keyboard nobody touched. */
+    mk2_scan_note(kscan_matrix_read(data->dev));
 }
 
 static int kscan_matrix_configure(const struct device *dev, const kscan_callback_t callback) {

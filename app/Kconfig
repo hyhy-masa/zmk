@@ -341,7 +341,7 @@ config MK2_SPLIT_NOTIFY_STATS_SELFTEST
       exactly like the defect under investigation, so never ship this enabled.
 
 config MK2_KSCAN_DROP_STATS
-    bool "MK2: local kscan edge-loss statistics and evict-oldest recovery"
+    bool "MK2: local kscan edge loss, queue wait, and scan liveness"
     default n
     depends on ZMK_KSCAN
     help

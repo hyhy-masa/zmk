@@ -7,6 +7,7 @@
 #include <zephyr/types.h>
 #include <zephyr/init.h>
 #include <zephyr/kernel.h>
+#include <zephyr/sys/atomic.h>
 
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
@@ -174,9 +175,18 @@ struct mk2_split_loss_rec {
 static struct mk2_split_loss_rec split_pos_loss_ring[MK2_SPLIT_LOSS_RING];
 static uint32_t split_pos_loss_next;
 static uint32_t split_pos_drop_count;
+/* Sensor, input, relay and battery events share this queue with key edges. Losing one
+ * cannot strand a key, so they are not rolled back - but until now their loss was not
+ * counted either, which meant the queue could be overflowing while the drop counter read
+ * zero. A zero that means "nothing was measured" is the failure mode this whole exercise
+ * keeps running into. */
+static atomic_t split_other_drop_count;
+/* Kept apart from the queue counter above on purpose. A short notification and a full queue
+ * are different faults with different fixes, and a single number that can mean either is a
+ * number nobody can act on. */
+static atomic_t split_short_notify_count;
 static uint32_t split_pos_drop_max_q;
 static uint32_t split_pos_drain_last_ms;
-static uint32_t split_pos_drain_max_gap_ms;
 
 #if CONFIG_MK2_SPLIT_POS_DROP_SELFTEST > 0
 static uint32_t split_pos_drop_selftest_attempt;
@@ -201,19 +211,34 @@ static void mk2_split_pos_note_loss(uint32_t position, bool pressed, int err,
     irq_unlock(key);
 }
 
-static void mk2_split_pos_note_drain(void) {
+/* Only a timestamp now. The gap between drains used to be recorded as if it meant something,
+ * but this consumer runs only when there is work, so the largest gap it can ever see is the
+ * longest the operator went without typing - eight hours of sleep, on the readout that
+ * prompted this. The number that does mean something is how long an event WAITED, measured
+ * below from the stamp each one carries. */
+static void mk2_split_pos_note_drain(void) { split_pos_drain_last_ms = k_uptime_get_32(); }
+
+/* Longest an arrived key event sat before the consumer reached it. Single-digit milliseconds
+ * in normal use; seconds is typing that was dead for that long. */
+static uint32_t split_pos_max_wait_ms;
+static uint32_t split_pos_max_wait_at_ms;
+
+static void mk2_split_pos_note_wait(uint32_t queued_ms) {
     uint32_t now = k_uptime_get_32();
+    uint32_t waited = now - queued_ms;
 
-    if (split_pos_drain_last_ms != 0) {
-        uint32_t gap = now - split_pos_drain_last_ms;
-
-        if (gap > split_pos_drain_max_gap_ms) {
-            split_pos_drain_max_gap_ms = gap;
-        }
+    if (waited > split_pos_max_wait_ms) {
+        split_pos_max_wait_ms = waited;
+        split_pos_max_wait_at_ms = now;
     }
-
-    split_pos_drain_last_ms = now;
 }
+
+/* atomic because the producers sit in different contexts - the BT RX path and the system
+ * work queue both reach here. A plain ++ can lose an update, and a counter whose zero cannot
+ * be trusted is the failure this whole exercise keeps circling back to. */
+static void mk2_split_note_other_drop(void) { atomic_inc(&split_other_drop_count); }
+
+static void mk2_split_note_short_notify(void) { atomic_inc(&split_short_notify_count); }
 
 static void mk2_split_pos_note_queue(uint32_t used) {
     /* Sampled on every event, not just on failure: after a failed put the queue is by
@@ -227,11 +252,12 @@ static void mk2_split_pos_note_queue(uint32_t used) {
 void mk2_split_pos_drop_dump(void) {
     /* now_ms closes the measurement window: without it a drop count cannot be told
      * apart from a stale one, and no rate can be derived. */
-    printk("[MK2_DIAG] split_pos_drop=%u,max_q=%u/%u,drain_max_gap_ms=%u,"
-           "since=boot,now_ms=%u\n",
-           split_pos_drop_count, split_pos_drop_max_q,
-           (uint32_t)CONFIG_ZMK_SPLIT_BLE_CENTRAL_POSITION_QUEUE_SIZE, split_pos_drain_max_gap_ms,
-           k_uptime_get_32());
+    printk("[MK2_DIAG] split_pos_drop=%u,other_drop=%u,short_notify=%u,max_q=%u/%u,"
+           "max_wait_ms=%u@%u,since=boot,now_ms=%u\n",
+           split_pos_drop_count, (uint32_t)atomic_get(&split_other_drop_count),
+           (uint32_t)atomic_get(&split_short_notify_count), split_pos_drop_max_q,
+           (uint32_t)CONFIG_ZMK_SPLIT_BLE_CENTRAL_POSITION_QUEUE_SIZE, split_pos_max_wait_ms,
+           split_pos_max_wait_at_ms, k_uptime_get_32());
 
     uint32_t shown = MIN(split_pos_loss_next, (uint32_t)MK2_SPLIT_LOSS_RING);
 
@@ -264,7 +290,10 @@ void mk2_split_pos_drop_reset(void) {}
 
 static inline void mk2_split_pos_note_loss(uint32_t position, bool pressed, int err, int kind) {}
 static inline void mk2_split_pos_note_drain(void) {}
+static inline void mk2_split_pos_note_wait(uint32_t queued_ms) {}
 static inline void mk2_split_pos_note_queue(uint32_t used) {}
+static inline void mk2_split_note_other_drop(void) {}
+static inline void mk2_split_note_short_notify(void) {}
 
 #define MK2_SPLIT_LOSS_ROLLED_BACK 0
 #define MK2_SPLIT_LOSS_ON_DISCONNECT 1
@@ -367,6 +396,11 @@ static const struct bt_uuid_128 split_service_uuid = BT_UUID_INIT_128(ZMK_SPLIT_
 struct peripheral_event_wrapper {
     uint8_t source;
     struct zmk_split_transport_peripheral_event event;
+#if IS_ENABLED(CONFIG_MK2_SPLIT_POS_DROP_STATS)
+    /* Set when the event is queued; the consumer subtracts it. A stall on this side loses
+     * nothing for a drop counter to see, so the wait is the only trace it leaves. */
+    uint32_t queued_ms;
+#endif
 };
 
 K_MSGQ_DEFINE(peripheral_event_msgq, sizeof(struct peripheral_event_wrapper),
@@ -391,12 +425,25 @@ K_WORK_DEFINE(peripheral_event_work, peripheral_event_work_callback);
  * strand a key held forever, which is the exact defect being hunted. Failing the put instead
  * leaves the newest edge in the caller's hands, where it can be undone. */
 static int split_enqueue_peripheral_event(struct peripheral_event_wrapper *ev) {
+#if IS_ENABLED(CONFIG_MK2_SPLIT_POS_DROP_STATS)
+    ev->queued_ms = k_uptime_get_32();
+#endif
     int err = k_msgq_put(&peripheral_event_msgq, ev, K_NO_WAIT);
 
     mk2_split_pos_note_queue(k_msgq_num_used_get(&peripheral_event_msgq));
     k_work_submit(&peripheral_event_work);
 
     return err;
+}
+
+/* For everything on this queue that is not a key edge: sensor, input, relay, battery.
+ * Nothing to roll back - a lost battery reading is a stale percentage, not a stuck key -
+ * but it is counted, so the queue's true pressure is visible rather than being read off
+ * the key events alone. */
+static void split_enqueue_other_event(struct peripheral_event_wrapper *ev) {
+    if (split_enqueue_peripheral_event(ev) != 0) {
+        mk2_split_note_other_drop();
+    }
 }
 
 int peripheral_slot_index_for_conn(struct bt_conn *conn) {
@@ -437,6 +484,20 @@ int release_peripheral_slot(int index) {
     }
     slot->state = PERIPHERAL_SLOT_STATE_OPEN;
 
+    /* There IS a race here, and it is deliberately left alone.
+     *
+     * conn and state above are cleared outside any lock, so an in-flight notification can
+     * still commit a bit into this slot after it has been marked OPEN, and that bit has
+     * nothing left to release it. An attempt to fix it by zeroing first and releasing from a
+     * copy was written and then withdrawn: it moved the race rather than closing it, because
+     * the notification would then queue its decoded press AFTER these releases and the key
+     * would end up held anyway.
+     *
+     * Closing it properly means one synchronisation contract over conn, state, a slot
+     * generation and the event ordering - not a lock around sixteen bytes. That is a
+     * behaviour change, and it does not belong in a build whose job is to find out what is
+     * actually happening. Instrument first, then fix.
+     */
     // Raise events releasing any active positions from this peripheral
     for (int i = 0; i < POSITION_STATE_DATA_LEN; i++) {
         for (int j = 0; j < 8; j++) {
@@ -552,8 +613,7 @@ static uint8_t split_central_sensor_notify_func(struct bt_conn *conn,
                                .sensor_index = sensor_event.sensor_index,
                            }}}};
 
-    k_msgq_put(&peripheral_event_msgq, &event_wrapper, K_NO_WAIT);
-    k_work_submit(&peripheral_event_work);
+    split_enqueue_other_event(&event_wrapper);
 
     return BT_GATT_ITER_CONTINUE;
 }
@@ -684,8 +744,7 @@ static uint8_t split_central_relay_event_notify_func(struct bt_conn *conn,
             event_wrapper.event.data.relay_event.event_type,
             event_wrapper.event.data.relay_event.header.event_data_size, length);
 
-    k_msgq_put(&peripheral_event_msgq, &event_wrapper, K_NO_WAIT);
-    k_work_submit(&peripheral_event_work);
+    split_enqueue_other_event(&event_wrapper);
 
     return BT_GATT_ITER_CONTINUE;
 }
@@ -726,8 +785,7 @@ static uint8_t peripheral_input_event_notify_cb(struct bt_conn *conn,
                                        .value = payload.value,
                                    }}}};
 
-            k_msgq_put(&peripheral_event_msgq, &event_wrapper, K_NO_WAIT);
-            k_work_submit(&peripheral_event_work);
+            split_enqueue_other_event(&event_wrapper);
             break;
         }
     }
@@ -754,6 +812,18 @@ static uint8_t split_central_notify_func(struct bt_conn *conn,
     }
 
     LOG_DBG("[NOTIFICATION] data %p length %u", data, length);
+
+    /* The loop below reads POSITION_STATE_DATA_LEN bytes whatever the notification's actual
+     * size. A short one therefore read past the end of the buffer and XORed whatever
+     * happened to follow it into the key state - inventing presses and releases for keys
+     * nobody touched. Refusing it costs one snapshot, and the peripheral sends whole state,
+     * so the next notification restores everything. */
+    if (length < POSITION_STATE_DATA_LEN) {
+        LOG_WRN("Ignoring short position notification (%u < %d)", length,
+                POSITION_STATE_DATA_LEN);
+        mk2_split_note_short_notify();
+        return BT_GATT_ITER_CONTINUE;
+    }
 
     for (int i = 0; i < POSITION_STATE_DATA_LEN; i++) {
         slot->changed_positions[i] = ((uint8_t *)data)[i] ^ slot->position_state[i];
@@ -799,7 +869,14 @@ static uint8_t split_central_notify_func(struct bt_conn *conn,
                      * It is not free. If the edge that was lost was a press, its release will
                      * now cancel against the restored bit and the whole tap disappears: one
                      * character that never arrives. That is a much smaller fault than a key
-                     * that never comes back up, which is the trade being made here. */
+                     * that never comes back up, which is the trade being made here.
+                     *
+                     * Not locked, and the reason is worth stating: a lock here would not be
+                     * enough anyway. If a disconnect has zeroed the array in between, this
+                     * XOR raises the bit again from zero and invents a held key. Guarding it
+                     * needs the same slot-lifetime contract as the disconnect path, which is
+                     * a separate piece of work. Until then the failure is at least recorded
+                     * below, so it cannot happen invisibly. */
                     slot->position_state[i] ^= BIT(j);
                     mk2_split_pos_note_loss(position, pressed, put_err,
                                             MK2_SPLIT_LOSS_ROLLED_BACK);
@@ -845,8 +922,7 @@ static uint8_t split_central_battery_level_notify_func(struct bt_conn *conn,
                                .level = battery_level,
                            }}}};
 
-    k_msgq_put(&peripheral_event_msgq, &ev, K_NO_WAIT);
-    k_work_submit(&peripheral_event_work);
+    split_enqueue_other_event(&ev);
 
     return BT_GATT_ITER_CONTINUE;
 }
@@ -889,8 +965,7 @@ static uint8_t split_central_battery_level_read_func(struct bt_conn *conn, uint8
                                .level = battery_level,
                            }}}};
 
-    k_msgq_put(&peripheral_event_msgq, &ev, K_NO_WAIT);
-    k_work_submit(&peripheral_event_work);
+    split_enqueue_other_event(&ev);
 
     return BT_GATT_ITER_CONTINUE;
 }
@@ -1418,8 +1493,7 @@ static void split_central_disconnected(struct bt_conn *conn, uint8_t reason) {
                                .level = 0,
                            }}}};
 
-    k_msgq_put(&peripheral_event_msgq, &ev, K_NO_WAIT);
-    k_work_submit(&peripheral_event_work);
+    split_enqueue_other_event(&ev);
     // struct zmk_peripheral_battery_state_changed ev = {
     //     .source = peripheral_slot_index_for_conn(conn), .state_of_charge = 0};
     // k_msgq_put(&peripheral_batt_lvl_msgq, &ev, K_NO_WAIT);
@@ -1749,6 +1823,7 @@ void peripheral_event_work_callback(struct k_work *work) {
     mk2_split_pos_note_drain();
 
     while (k_msgq_get(&peripheral_event_msgq, &ev, K_NO_WAIT) == 0) {
+        mk2_split_pos_note_wait(ev.queued_ms);
         LOG_DBG("Trigger key position state change for %d",
                 ev.event.data.key_position_event.position);
         zmk_split_transport_central_peripheral_event_handler(&bt_central, ev.source, ev.event);

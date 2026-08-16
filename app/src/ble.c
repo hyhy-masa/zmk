@@ -515,6 +515,88 @@ static bool is_conn_active_profile(const struct bt_conn *conn) {
     return bt_addr_le_cmp(bt_conn_get_dst(conn), &profiles[active_profile].peer) == 0;
 }
 
+#if IS_ENABLED(CONFIG_MK2_HOST_LINK_STATS)
+
+/* Pulled in here rather than relied on transitively: k_uptime_get_32() reaches this file
+ * today only because something else happens to include kernel.h, which is not a property
+ * to build a measurement on. */
+#include <zephyr/kernel.h>
+
+/* This half's link to the host - the one hop nothing here has ever measured.
+ *
+ * [SPLINK] counts the link between the two halves. Every other counter in this file
+ * reports whether a notification succeeded. Neither answers the question the owner and
+ * the customer both actually ask, which is that the keyboard disappeared from the host.
+ * A send failure can only appear if something was sent, so a link that drops while
+ * nobody is typing produces no send, no failure, and no trace: that is exactly how a
+ * drop observed at 23:33 left every existing counter reading zero.
+ *
+ * reason is the HCI error code from the controller, and it decides which fault this is.
+ * 0x08 is a supervision timeout - the two ends stopped hearing each other, so it is a
+ * radio problem. 0x13 and 0x16 mean one end asked to close the link, which is a host or
+ * protocol decision rather than a radio one; a deliberate profile switch looks like this
+ * and is not a fault at all. 0x3e is a connection that failed to complete. Those call for
+ * opposite fixes, so a bare count would not be actionable - the reason has to travel
+ * with it.
+ *
+ * fail= is the case with no counter anywhere in the tree: connected() invoked with
+ * err != 0, meaning the host tried to attach and could not. That is the literal wording
+ * of the customer report, and today it returns early without leaving anything behind.
+ *
+ * Counters are since boot and are never cleared, for the reason spelled out at
+ * mk2_split_pos_drop_reset(): a zero from a cleared counter and a zero meaning "this
+ * never happened" must not be made to look alike. */
+static uint32_t host_link_disc_count;
+static uint32_t host_link_conn_count;
+static uint32_t host_link_fail_count;
+static uint8_t host_link_last_reason;
+static uint8_t host_link_last_fail_err;
+/* 0xff rather than 0, so "no event yet" is not read as "profile 0". */
+static uint8_t host_link_last_profile = 0xff;
+static uint32_t host_link_last_disc_ms;
+static uint32_t host_link_last_conn_ms;
+/* Shortest disconnect-to-reconnect gap seen. A drop nobody notices and one that
+ * interrupts typing are the same event in a count; the gap is what separates them. */
+static uint32_t host_link_min_gap_ms;
+
+static void mk2_host_link_note_conn(uint8_t profile) {
+    uint32_t now = k_uptime_get_32();
+
+    host_link_conn_count++;
+    host_link_last_conn_ms = now;
+    host_link_last_profile = profile;
+
+    /* Only meaningful once a disconnect has been seen. Measured from boot it would be
+     * the time to first pairing, which is a different quantity wearing the same name. */
+    if (host_link_disc_count > 0) {
+        uint32_t gap = now - host_link_last_disc_ms;
+
+        if (host_link_min_gap_ms == 0 || gap < host_link_min_gap_ms) {
+            host_link_min_gap_ms = gap;
+        }
+    }
+}
+
+static void mk2_host_link_note_disc(uint8_t reason, uint8_t profile) {
+    host_link_disc_count++;
+    host_link_last_reason = reason;
+    host_link_last_disc_ms = k_uptime_get_32();
+    host_link_last_profile = profile;
+}
+
+static void mk2_host_link_note_fail(uint8_t err) {
+    host_link_fail_count++;
+    host_link_last_fail_err = err;
+}
+
+#else
+
+static inline void mk2_host_link_note_conn(uint8_t profile) {}
+static inline void mk2_host_link_note_disc(uint8_t reason, uint8_t profile) {}
+static inline void mk2_host_link_note_fail(uint8_t err) {}
+
+#endif /* CONFIG_MK2_HOST_LINK_STATS */
+
 #if IS_ENABLED(CONFIG_MK2_BLE_DIAG)
 
 #include <string.h>
@@ -633,6 +715,33 @@ void mk2_ble_diag_reset(void) {
     mk2_split_link_reset();
 }
 
+#if IS_ENABLED(CONFIG_MK2_HOST_LINK_STATS)
+
+/* linked= is answered from the connection parameters rather than from the callbacks
+ * above, so the readout does not rest on the one piece of wiring under suspicion.
+ * [SPLINK] cost a day to the opposite arrangement: "conn=0" was read as "the link never
+ * came up" when the truth was that the counter had never been reached at all. The
+ * parameters are zeroed on disconnect, so a non-zero interval means a live link, and it
+ * says so without consulting host_link_conn_count.
+ *
+ * Its one limit, stated rather than left to be discovered: the parameters are only
+ * written for the active profile, so linked= describes the profile in use and is silent
+ * about any other paired host. */
+static void mk2_host_link_dump(void) {
+    printk("[HOSTLINK] linked=%u disc=%u conn=%u fail=%u last_reason=0x%02x last_fail=0x%02x "
+           "last_disc_ms=%u last_conn_ms=%u min_gap_ms=%u profile=%u since=boot now_ms=%u\n",
+           atomic_get(&mk2_diag_interval) != 0 ? 1U : 0U, host_link_disc_count,
+           host_link_conn_count, host_link_fail_count, host_link_last_reason,
+           host_link_last_fail_err, host_link_last_disc_ms, host_link_last_conn_ms,
+           host_link_min_gap_ms, host_link_last_profile, k_uptime_get_32());
+}
+
+#else
+
+static inline void mk2_host_link_dump(void) {}
+
+#endif /* CONFIG_MK2_HOST_LINK_STATS */
+
 void mk2_ble_diag_dump(void) {
     static const char *const pipe_name[3] = {"kbd", "consumer", "mouse"};
     printk("[MK2_DIAG]\n");
@@ -654,6 +763,10 @@ void mk2_ble_diag_dump(void) {
            (uint16_t)atomic_get(&mk2_diag_timeout));
     mk2_split_pos_drop_dump();
     mk2_split_link_dump();
+    /* Printed next to [SPLINK] on purpose: one line is the link to the other half, the
+     * next is the link to the host, and the customer's "it disconnected" has to be
+     * assigned to one of them before anything else is worth doing. */
+    mk2_host_link_dump();
     /* This half's own key scanning, last. The peripheral prints the same block from its
      * [NGUARD] timer, so the two [KGUARD] lines can be laid side by side: whichever half
      * shows a key held that the fingers have released is the half that lost the edge. */
@@ -730,6 +843,11 @@ static void connected(struct bt_conn *conn, uint8_t err) {
 
     if (err) {
         LOG_WRN("Failed to connect to %s (%u)", addr, err);
+        /* Counted without a profile: the connection never completed, so there is no
+         * peer address to match one against. This is the branch the customer report
+         * "cannot connect over Bluetooth" lands in, and until now it returned here
+         * leaving nothing behind. */
+        mk2_host_link_note_fail(err);
         update_advertising();
         return;
     }
@@ -741,6 +859,10 @@ static void connected(struct bt_conn *conn, uint8_t err) {
     if (is_conn_active_profile(conn)) {
         LOG_DBG("Active profile connected");
         mk2_ble_diag_set_conn_params(info.le.interval, info.le.latency, info.le.timeout);
+        /* Counted on the active profile only, matching linked= and the disconnect side.
+         * Mixing in other paired hosts would make disc= and conn= describe different
+         * populations, and the difference between them is the number being read. */
+        mk2_host_link_note_conn((uint8_t)active_profile);
         k_work_submit(&raise_profile_changed_event_work);
     }
 }
@@ -766,6 +888,9 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
 
     if (is_conn_active_profile(conn)) {
         LOG_DBG("Active profile disconnected");
+        /* Before the parameters are zeroed, so the recorded moment is the disconnect
+         * itself and not the bookkeeping that follows it. */
+        mk2_host_link_note_disc(reason, (uint8_t)active_profile);
         mk2_ble_diag_set_conn_params(0, 0, 0);
 #if IS_ENABLED(CONFIG_ZMK_POINTING)
         // Drop pending mouse motion on disconnect so a reconnect doesn't replay

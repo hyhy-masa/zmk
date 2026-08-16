@@ -286,6 +286,41 @@ config MK2_SPLIT_LINK_STATS
       Measurement only: no GATT change, no settings_reset, no change to connection
       handling. Depends on MK2_BLE_DIAG because that footer is the only readout path.
 
+config MK2_HOST_LINK_STATS
+    bool "MK2: host link connect/disconnect statistics"
+    default n
+    depends on ZMK_BLE && MK2_BLE_DIAG
+    help
+      Records the link to the host going down, coming back, or failing to come up at
+      all. MK2_SPLIT_LINK_STATS covers the link between the halves; this covers the
+      other hop, which nothing has measured until now.
+
+      The gap this closes: every existing counter reports whether a notification
+      succeeded, and a notification can only fail if something was sent. A link that
+      drops while nobody is typing produces no send, so it leaves every counter at
+      zero - which is what happened on 2026-08-15 when the owner watched the keyboard
+      disappear from the host and the readout afterwards showed nothing at all. A zero
+      there means "not measured", not "did not happen", and that is precisely the
+      confusion these counters exist to remove.
+
+      fail= is the branch with no counter anywhere: connected() invoked with a non-zero
+      error, i.e. the host tried to attach and could not. That is the literal customer
+      report ("cannot connect over BT"), and today it returns early leaving no trace.
+
+      reason is the HCI error code: 0x08 supervision timeout (the two ends stopped
+      hearing each other - a radio problem), 0x13/0x16 one end closed the link
+      deliberately (a host or protocol decision, and what a normal profile switch looks
+      like), 0x3e a connection attempt that never completed. Radio and protocol faults
+      call for opposite fixes, so the count alone would not be actionable.
+
+      linked= is read from the connection parameters rather than from these counters, so
+      a miswired callback shows up as a disagreement between the two instead of as a
+      silent zero. It reflects the active profile only.
+
+      Measurement only: no GATT change, no settings_reset, no change to connection or
+      advertising handling. Depends on MK2_BLE_DIAG because that footer is the only
+      readout path.
+
 config MK2_SPLIT_POS_DROP_STATS
     bool "MK2: split position drop statistics"
     default n

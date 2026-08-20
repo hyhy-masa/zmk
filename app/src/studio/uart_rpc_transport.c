@@ -124,18 +124,32 @@ static void serial_cb(const struct device *dev, void *user_data) {
 
     if (uart_irq_tx_ready(uart_dev)) {
         struct ring_buf *tx_buf = zmk_rpc_get_tx_buf();
-        uint32_t len;
-        while ((len = ring_buf_size_get(tx_buf)) > 0) {
-            uint8_t *buf;
-            uint32_t claim_len = ring_buf_get_claim(tx_buf, &buf, tx_buf->size);
+        uint8_t *buf;
+        uint32_t claim_len = ring_buf_get_claim(tx_buf, &buf, tx_buf->size);
 
-            if (claim_len == 0) {
-                continue;
-            }
-
+        if (claim_len > 0) {
             int sent = uart_fifo_fill(uart_dev, buf, claim_len);
 
             ring_buf_get_finish(tx_buf, MAX(sent, 0));
+        }
+
+        /* Hand over at most one FIFO load per interrupt, and stop asking once
+         * the ring is drained.
+         *
+         * This used to loop `while (ring_buf_size_get(tx_buf) > 0)`. With the
+         * USB FIFO full, uart_fifo_fill() returns 0, the ring never shrinks,
+         * and the loop spins inside the ISR — a condition that cannot resolve
+         * from interrupt context, because the FIFO only drains after we
+         * return. The device stops servicing USB and the host sees the CDC
+         * link drop (read() == EOF). Large responses reach it; a small
+         * getDeviceInfo fits in one FIFO load and does not.
+         *
+         * uart_irq_tx_disable() appeared nowhere in this file, so once
+         * tx_notify() enabled TX the interrupt kept re-firing on an empty ring.
+         * Disabling here cannot strand data: tx_notify() re-enables TX whenever
+         * more bytes are queued. */
+        if (claim_len == 0 || ring_buf_size_get(tx_buf) == 0) {
+            uart_irq_tx_disable(uart_dev);
         }
     }
 }

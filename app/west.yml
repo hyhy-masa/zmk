@@ -6,10 +6,12 @@ manifest:
       url-base: https://github.com/zmkfirmware
     - name: cormoran
       url-base: https://github.com/cormoran
+    - name: hyhy-masa
+      url-base: https://github.com/hyhy-masa
   projects:
     - name: zephyr
-      remote: zmkfirmware
-      revision: v3.5.0+zmk-fixes
+      remote: hyhy-masa
+      revision: v3.5.0+zmk-fixes+mk
       clone-depth: 1
       import:
         name-blocklist:

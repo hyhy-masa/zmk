@@ -196,6 +196,46 @@ static struct zmk_kscan_msg_processor {
 K_MSGQ_DEFINE(physical_layouts_kscan_msgq, sizeof(struct zmk_kscan_event),
               CONFIG_ZMK_KSCAN_EVENT_QUEUE_SIZE, 4);
 
+/* The queue must be able to hold everything one scan can produce.
+ *
+ * The producer (the scan work) and the consumer (msg_processor below) both run on the system
+ * work queue, which is serial: the consumer cannot be preempted mid-scan, and the scan cannot
+ * run again until the consumer has drained. So the deepest the queue can ever get is one
+ * scan's worth of edges, and one scan can at most report every key in the matrix changing at
+ * once. Sized above that, overflow is not merely unlikely - it is unreachable.
+ *
+ * This replaces an evict-the-oldest recovery that was wrong: the oldest queued edge is as
+ * likely to be a release as the newest, and dropping a release strands that key held forever
+ * - the exact defect being hunted. A recovery that can cause the fault is not a recovery.
+ * Making overflow impossible is the fix.
+ *
+ * This assert sits OUTSIDE the diagnostics block on purpose. It used to live inside
+ * CONFIG_MK2_KSCAN_DROP_STATS, so a build with the counters off - which is what ships from
+ * v1.0.6 on - kept the fix and lost the one check that proves the queue is big enough. A
+ * later change to the queue size would then have brought the stuck-key fault back on
+ * customer hardware only, where nothing is left to record it. */
+/* Taken from the kscan node rather than from zmk/matrix.h: ZMK_MATRIX_ROWS/COLS there are
+ * only defined for boards WITHOUT a zmk,physical-layout, and this one has one. Reading the
+ * layout's own kscan phandle also gives the matrix of THIS half, which is the number that
+ * matters - the shared transform covers both halves and would overstate it. */
+#define MK2_KSCAN_NODE DT_PHANDLE(DT_CHOSEN(zmk_physical_layout), kscan)
+
+#if DT_NODE_HAS_PROP(MK2_KSCAN_NODE, row_gpios) && DT_NODE_HAS_PROP(MK2_KSCAN_NODE, col_gpios)
+#define MK2_KSCAN_MAX_PER_SCAN                                                                     \
+    (DT_PROP_LEN(MK2_KSCAN_NODE, row_gpios) * DT_PROP_LEN(MK2_KSCAN_NODE, col_gpios))
+
+BUILD_ASSERT(CONFIG_ZMK_KSCAN_EVENT_QUEUE_SIZE > MK2_KSCAN_MAX_PER_SCAN,
+             "kscan queue must exceed one scan's worth of edges, or a key release can be lost");
+#else
+
+/* Fail loud rather than quietly skip: the claim that overflow is unreachable rests entirely
+ * on the assert above. Without it the build looks identical and behaves differently the first
+ * time one scan fills the queue. */
+#warning "kscan queue size cannot be proven to exceed one scan: kscan is not a GPIO matrix"
+#define MK2_KSCAN_MAX_PER_SCAN 0
+
+#endif
+
 #if IS_ENABLED(CONFIG_MK2_KSCAN_DROP_STATS)
 
 /* Local key-scan edge loss, on whichever half this build runs on.
@@ -217,40 +257,6 @@ K_MSGQ_DEFINE(physical_layouts_kscan_msgq, sizeof(struct zmk_kscan_event),
 #define MK2_KSCAN_HELD_LEN 16
 
 BUILD_ASSERT(MK2_KSCAN_HELD_LEN == 16, "[KGUARD] held= formatting expects a 16 byte bitmap");
-
-/* The queue must be able to hold everything one scan can produce.
- *
- * The producer (the scan work) and the consumer (msg_processor below) both run on the system
- * work queue, which is serial: the consumer cannot be preempted mid-scan, and the scan cannot
- * run again until the consumer has drained. So the deepest the queue can ever get is one
- * scan's worth of edges, and one scan can at most report every key in the matrix changing at
- * once. Sized above that, overflow is not merely unlikely - it is unreachable.
- *
- * This replaces an evict-the-oldest recovery that was wrong: the oldest queued edge is as
- * likely to be a release as the newest, and dropping a release strands that key held forever
- * - the exact defect being hunted. A recovery that can cause the fault is not a recovery.
- * Making overflow impossible is the fix; the counters below stay as proof it never happens. */
-/* Taken from the kscan node rather than from zmk/matrix.h: ZMK_MATRIX_ROWS/COLS there are
- * only defined for boards WITHOUT a zmk,physical-layout, and this one has one. Reading the
- * layout's own kscan phandle also gives the matrix of THIS half, which is the number that
- * matters - the shared transform covers both halves and would overstate it. */
-#define MK2_KSCAN_NODE DT_PHANDLE(DT_CHOSEN(zmk_physical_layout), kscan)
-
-#if DT_NODE_HAS_PROP(MK2_KSCAN_NODE, row_gpios) && DT_NODE_HAS_PROP(MK2_KSCAN_NODE, col_gpios)
-#define MK2_KSCAN_MAX_PER_SCAN                                                                     \
-    (DT_PROP_LEN(MK2_KSCAN_NODE, row_gpios) * DT_PROP_LEN(MK2_KSCAN_NODE, col_gpios))
-
-BUILD_ASSERT(CONFIG_ZMK_KSCAN_EVENT_QUEUE_SIZE > MK2_KSCAN_MAX_PER_SCAN,
-             "kscan queue must exceed one scan's worth of edges, or a key release can be lost");
-#else
-
-/* Fail loud rather than quietly skip: the whole point of this block is that overflow is
- * unreachable, and that claim rests on the assert above. Without it the counters would still
- * tick but the guarantee would be gone, which reads exactly like a guarantee that holds. */
-#warning "MK2_KSCAN_DROP_STATS cannot prove the queue exceeds one scan: kscan is not a GPIO matrix"
-#define MK2_KSCAN_MAX_PER_SCAN 0
-
-#endif
 
 enum mk2_kscan_loss_kind {
     /* Nothing could be queued at all. Per the assert above this cannot happen; if the counter

@@ -220,7 +220,14 @@ K_MSGQ_DEFINE(physical_layouts_kscan_msgq, sizeof(struct zmk_kscan_event),
  * matters - the shared transform covers both halves and would overstate it. */
 #define MK2_KSCAN_NODE DT_PHANDLE(DT_CHOSEN(zmk_physical_layout), kscan)
 
-#if DT_NODE_HAS_PROP(MK2_KSCAN_NODE, row_gpios) && DT_NODE_HAS_PROP(MK2_KSCAN_NODE, col_gpios)
+#if !DT_HAS_CHOSEN(zmk_physical_layout)
+
+/* This build has no physical layout, so it never scans a key - settings_reset is the one that
+ * ships that way. There is no queue here to prove anything about, and warning anyway would fire
+ * on every release build forever, which is how people learn to scroll past warnings. */
+#define MK2_KSCAN_MAX_PER_SCAN 0
+
+#elif DT_NODE_HAS_PROP(MK2_KSCAN_NODE, row_gpios) && DT_NODE_HAS_PROP(MK2_KSCAN_NODE, col_gpios)
 #define MK2_KSCAN_MAX_PER_SCAN                                                                     \
     (DT_PROP_LEN(MK2_KSCAN_NODE, row_gpios) * DT_PROP_LEN(MK2_KSCAN_NODE, col_gpios))
 
@@ -231,7 +238,7 @@ BUILD_ASSERT(CONFIG_ZMK_KSCAN_EVENT_QUEUE_SIZE > MK2_KSCAN_MAX_PER_SCAN,
 /* Fail loud rather than quietly skip: the claim that overflow is unreachable rests entirely
  * on the assert above. Without it the build looks identical and behaves differently the first
  * time one scan fills the queue. */
-#warning "kscan queue size cannot be proven to exceed one scan: kscan is not a GPIO matrix"
+#warning "kscan queue size cannot be proven to exceed one scan: this layout's kscan is not a GPIO matrix"
 #define MK2_KSCAN_MAX_PER_SCAN 0
 
 #endif

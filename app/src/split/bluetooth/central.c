@@ -223,7 +223,35 @@ static void mk2_split_pos_note_drain(void) { split_pos_drain_last_ms = k_uptime_
 static uint32_t split_pos_max_wait_ms;
 static uint32_t split_pos_max_wait_at_ms;
 
-static void mk2_split_pos_note_wait(uint32_t queued_ms) {
+/* The maximum on its own cannot be matched to a report.
+ *
+ * A 4,795 ms stall measured one evening keeps the pair above for the rest of the boot, so a
+ * five second stall the owner reports the next morning leaves no trace whatsoever: both
+ * numbers are unchanged and the readout is indistinguishable from a keyboard that never
+ * stalled at all. That happened, and it cost a night of measurement. Keep the recent long
+ * waits as well, each with the moment it was taken, so a time the owner writes down can be
+ * matched against them. */
+#define MK2_SPLIT_WAIT_RING 8
+/* Below this a wait is ordinary operation - single digit milliseconds is what a system work
+ * queue that is keeping up looks like - and recording those would push the interesting
+ * entries out of the ring within a second of typing. */
+#define MK2_SPLIT_WAIT_MIN_MS 150
+
+struct mk2_split_wait_rec {
+    uint32_t at_ms;
+    uint32_t waited_ms;
+    uint8_t type;
+    uint8_t position;
+    uint8_t pressed;
+};
+
+static struct mk2_split_wait_rec split_pos_wait_ring[MK2_SPLIT_WAIT_RING];
+/* Doubles as the total count of long waits. The ring holds eight, so without it there is no
+ * way to tell "eight happened" from "eight kept out of ninety". */
+static uint32_t split_pos_wait_next;
+
+static void mk2_split_pos_note_wait(uint32_t queued_ms,
+                                    const struct zmk_split_transport_peripheral_event *event) {
     uint32_t now = k_uptime_get_32();
     uint32_t waited = now - queued_ms;
 
@@ -231,6 +259,33 @@ static void mk2_split_pos_note_wait(uint32_t queued_ms) {
         split_pos_max_wait_ms = waited;
         split_pos_max_wait_at_ms = now;
     }
+
+    if (waited < MK2_SPLIT_WAIT_MIN_MS) {
+        return;
+    }
+
+    /* Same reason as the loss ring: written from the system work queue and read from the low
+     * priority one, so a record can otherwise be printed half updated - and a garbled record
+     * is worst exactly when it finally matters. */
+    unsigned int key = irq_lock();
+    struct mk2_split_wait_rec *rec =
+        &split_pos_wait_ring[split_pos_wait_next % MK2_SPLIT_WAIT_RING];
+
+    rec->at_ms = now;
+    rec->waited_ms = waited;
+    rec->type = (uint8_t)event->type;
+    /* The payload is a union, so position and pressed hold anything only for a key edge.
+     * Zeroed otherwise rather than copied across, because a plausible looking position read
+     * out of a battery event is worse than no position at all. */
+    if (event->type == ZMK_SPLIT_TRANSPORT_PERIPHERAL_EVENT_TYPE_KEY_POSITION_EVENT) {
+        rec->position = event->data.key_position_event.position;
+        rec->pressed = event->data.key_position_event.pressed ? 1 : 0;
+    } else {
+        rec->position = 0;
+        rec->pressed = 0;
+    }
+    split_pos_wait_next++;
+    irq_unlock(key);
 }
 
 /* atomic because the producers sit in different contexts - the BT RX path and the system
@@ -253,11 +308,12 @@ void mk2_split_pos_drop_dump(void) {
     /* now_ms closes the measurement window: without it a drop count cannot be told
      * apart from a stale one, and no rate can be derived. */
     printk("[MK2_DIAG] split_pos_drop=%u,other_drop=%u,short_notify=%u,max_q=%u/%u,"
-           "max_wait_ms=%u@%u,since=boot,now_ms=%u\n",
+           "max_wait_ms=%u@%u,wait_ge%u=%u,since=boot,now_ms=%u\n",
            split_pos_drop_count, (uint32_t)atomic_get(&split_other_drop_count),
            (uint32_t)atomic_get(&split_short_notify_count), split_pos_drop_max_q,
            (uint32_t)CONFIG_ZMK_SPLIT_BLE_CENTRAL_POSITION_QUEUE_SIZE, split_pos_max_wait_ms,
-           split_pos_max_wait_at_ms, k_uptime_get_32());
+           split_pos_max_wait_at_ms, (uint32_t)MK2_SPLIT_WAIT_MIN_MS, split_pos_wait_next,
+           k_uptime_get_32());
 
     uint32_t shown = MIN(split_pos_loss_next, (uint32_t)MK2_SPLIT_LOSS_RING);
 
@@ -273,6 +329,23 @@ void mk2_split_pos_drop_dump(void) {
                rec->position, rec->pressed ? "press" : "RELEASE",
                kind_name[rec->kind <= MK2_SPLIT_LOSS_ON_DISCONNECT ? rec->kind : 0], rec->err,
                rec->ms, rec->idle_ms);
+    }
+
+    /* Newest first, same order as the losses above, so a time the owner reports is found by
+     * reading down from the top rather than by hunting through the ring. */
+    uint32_t waits = MIN(split_pos_wait_next, (uint32_t)MK2_SPLIT_WAIT_RING);
+
+    for (uint32_t i = 0; i < waits; i++) {
+        const struct mk2_split_wait_rec *rec =
+            &split_pos_wait_ring[(split_pos_wait_next - 1 - i) % MK2_SPLIT_WAIT_RING];
+
+        if (rec->type == ZMK_SPLIT_TRANSPORT_PERIPHERAL_EVENT_TYPE_KEY_POSITION_EVENT) {
+            printk("[MK2_DIAG] split_wait[%u] %ums at=%u pos=%u %s\n", i, rec->waited_ms,
+                   rec->at_ms, rec->position, rec->pressed ? "press" : "RELEASE");
+        } else {
+            printk("[MK2_DIAG] split_wait[%u] %ums at=%u type=%u\n", i, rec->waited_ms, rec->at_ms,
+                   rec->type);
+        }
     }
 }
 
@@ -290,7 +363,9 @@ void mk2_split_pos_drop_reset(void) {}
 
 static inline void mk2_split_pos_note_loss(uint32_t position, bool pressed, int err, int kind) {}
 static inline void mk2_split_pos_note_drain(void) {}
-static inline void mk2_split_pos_note_wait(uint32_t queued_ms) {}
+static inline void
+mk2_split_pos_note_wait(uint32_t queued_ms,
+                        const struct zmk_split_transport_peripheral_event *event) {}
 static inline void mk2_split_pos_note_queue(uint32_t used) {}
 static inline void mk2_split_note_other_drop(void) {}
 static inline void mk2_split_note_short_notify(void) {}
@@ -1821,7 +1896,7 @@ void peripheral_event_work_callback(struct k_work *work) {
     mk2_split_pos_note_drain();
 
     while (k_msgq_get(&peripheral_event_msgq, &ev, K_NO_WAIT) == 0) {
-        mk2_split_pos_note_wait(ev.queued_ms);
+        mk2_split_pos_note_wait(ev.queued_ms, &ev.event);
         LOG_DBG("Trigger key position state change for %d",
                 ev.event.data.key_position_event.position);
         zmk_split_transport_central_peripheral_event_handler(&bt_central, ev.source, ev.event);

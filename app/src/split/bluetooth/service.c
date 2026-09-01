@@ -319,6 +319,41 @@ static uint32_t split_notify_fail[5];
 static int split_notify_last_err;
 static uint32_t split_notify_evicted;
 
+/* How long bt_gatt_notify() itself took, and when it last returned 0.
+ *
+ * ok above is the return value, not delivery, and the ATT notification path allocates its
+ * PDU with K_FOREVER - so when the connection's TX buffers are exhausted the call does not
+ * fail, it blocks. That produces a half that has stopped delivering while every error bucket
+ * here stays at zero, which is exactly the readout that ended four sessions. A call that
+ * takes seconds is that state, caught in the act.
+ *
+ * last_ok_ms answers the other half of it: if the operator reports dead keys and this is
+ * minutes old, nothing was sent - the fault is upstream of here, in scanning. */
+static uint32_t split_notify_last_ok_ms;
+static uint32_t split_notify_call_max_us;
+static uint32_t split_notify_call_max_at_ms;
+/* Calls at or over this are the ones worth counting; normal ones are microseconds. */
+#define MK2_NOTIFY_SLOW_US 150000
+static uint32_t split_notify_slow_count;
+static uint32_t split_notify_slow_last_ms;
+
+static void mk2_notify_note_call(uint32_t start_cycles, int err) {
+    uint32_t took_us = k_cyc_to_us_floor32(k_cycle_get_32() - start_cycles);
+    uint32_t now = k_uptime_get_32();
+
+    if (err == 0) {
+        split_notify_last_ok_ms = now;
+    }
+    if (took_us > split_notify_call_max_us) {
+        split_notify_call_max_us = took_us;
+        split_notify_call_max_at_ms = now;
+    }
+    if (took_us >= MK2_NOTIFY_SLOW_US) {
+        split_notify_slow_count++;
+        split_notify_slow_last_ms = now;
+    }
+}
+
 #if CONFIG_MK2_SPLIT_NOTIFY_STATS_SELFTEST > 0
 static uint32_t split_notify_selftest_attempt;
 #endif
@@ -364,6 +399,10 @@ static void split_notify_stats_dump_callback(struct k_work *work) {
                split_notify_ok, split_notify_fail[0], split_notify_fail[1], split_notify_fail[2],
                split_notify_fail[3], split_notify_fail[4], split_notify_last_err,
                split_notify_evicted, k_uptime_get_32());
+        /* A third call for the same stack reason as the split above. */
+        printk("[NGUARD] last_ok_ms=%u call_max_us=%u@%u slow_ge150ms=%u last_slow_ms=%u\n",
+               split_notify_last_ok_ms, split_notify_call_max_us, split_notify_call_max_at_ms,
+               split_notify_slow_count, split_notify_slow_last_ms);
         /* pos= is the peripheral's own view of which keys are held. If it shows a key down
          * that is physically released, the fault is in key scanning, not in the notify path. */
         printk("[NGUARD] pos=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
@@ -407,6 +446,8 @@ void send_position_state_callback(struct k_work *work) {
 #if IS_ENABLED(CONFIG_MK2_SPLIT_NOTIFY_STATS)
         int err;
 
+        uint32_t mk2_notify_start = k_cycle_get_32();
+
 #if CONFIG_MK2_SPLIT_NOTIFY_STATS_SELFTEST > 0
         split_notify_selftest_attempt++;
         if (split_notify_selftest_attempt % CONFIG_MK2_SPLIT_NOTIFY_STATS_SELFTEST == 0) {
@@ -417,6 +458,8 @@ void send_position_state_callback(struct k_work *work) {
 #else
         err = bt_gatt_notify(NULL, &split_svc.attrs[1], &state, sizeof(state));
 #endif
+        mk2_notify_note_call(mk2_notify_start, err);
+
         if (err == 0) {
             split_notify_ok++;
         } else {

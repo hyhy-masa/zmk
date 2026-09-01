@@ -288,6 +288,42 @@ static void mk2_split_pos_note_wait(uint32_t queued_ms,
     irq_unlock(key);
 }
 
+/* Notifications actually received from the peripheral, counted at the first instruction of
+ * the subscribe callback.
+ *
+ * Every other counter on this half sits downstream of that callback, and the peripheral's
+ * [NGUARD] ok is the return value of bt_gatt_notify() - not delivery. So "the left half sent
+ * and nothing arrived" and "it arrived and something dropped it later" produced identical
+ * readouts: all clean, on both halves. Four separate sessions ended there.
+ *
+ * rx is directly comparable to the peripheral's ok: one notify call should produce one
+ * receive. A divergence between the two is delivery loss, and it can be read at any time
+ * from the two cumulative numbers - the symptom does not have to be caught in the act,
+ * which is what made the previous three attempts fail.
+ *
+ * unsub counts the callback being invoked with data == NULL. That path sets value_handle to
+ * 0 and returns STOP, and nothing re-subscribes; the ACL stays up, so [SPLINK] disc never
+ * moves. It is the one way the link can go quiet without a single counter noticing. */
+static uint32_t split_rx_count;
+static uint32_t split_rx_last_ms;
+static uint32_t split_rx_unsub_count;
+static uint32_t split_rx_unsub_last_ms;
+/* The callback reached with no slot for the connection. Counted apart because it means the
+ * notification arrived and was discarded here, which is a different fault from not arriving. */
+static uint32_t split_rx_no_slot_count;
+
+static void mk2_split_note_rx(void) {
+    split_rx_count++;
+    split_rx_last_ms = k_uptime_get_32();
+}
+
+static void mk2_split_note_rx_unsub(void) {
+    split_rx_unsub_count++;
+    split_rx_unsub_last_ms = k_uptime_get_32();
+}
+
+static void mk2_split_note_rx_no_slot(void) { split_rx_no_slot_count++; }
+
 /* atomic because the producers sit in different contexts - the BT RX path and the system
  * work queue both reach here. A plain ++ can lose an update, and a counter whose zero cannot
  * be trusted is the failure this whole exercise keeps circling back to. */
@@ -314,6 +350,14 @@ void mk2_split_pos_drop_dump(void) {
            (uint32_t)CONFIG_ZMK_SPLIT_BLE_CENTRAL_POSITION_QUEUE_SIZE, split_pos_max_wait_ms,
            split_pos_max_wait_at_ms, (uint32_t)MK2_SPLIT_WAIT_MIN_MS, split_pos_wait_next,
            k_uptime_get_32());
+
+    /* Printed next to the queue numbers on purpose: rx is what arrived, and everything else
+     * on this line is what happened to it afterwards. Compare rx against the peripheral's
+     * [NGUARD] ok - they count the same events at opposite ends of the link. */
+    printk("[MK2_DIAG] split_rx=%u,last_rx_ms=%u,unsub=%u,last_unsub_ms=%u,no_slot=%u,"
+           "since=boot,now_ms=%u\n",
+           split_rx_count, split_rx_last_ms, split_rx_unsub_count, split_rx_unsub_last_ms,
+           split_rx_no_slot_count, k_uptime_get_32());
 
     uint32_t shown = MIN(split_pos_loss_next, (uint32_t)MK2_SPLIT_LOSS_RING);
 
@@ -367,6 +411,9 @@ static inline void
 mk2_split_pos_note_wait(uint32_t queued_ms,
                         const struct zmk_split_transport_peripheral_event *event) {}
 static inline void mk2_split_pos_note_queue(uint32_t used) {}
+static inline void mk2_split_note_rx(void) {}
+static inline void mk2_split_note_rx_unsub(void) {}
+static inline void mk2_split_note_rx_no_slot(void) {}
 static inline void mk2_split_note_other_drop(void) {}
 static inline void mk2_split_note_short_notify(void) {}
 
@@ -871,15 +918,20 @@ static uint8_t peripheral_input_event_notify_cb(struct bt_conn *conn,
 static uint8_t split_central_notify_func(struct bt_conn *conn,
                                          struct bt_gatt_subscribe_params *params, const void *data,
                                          uint16_t length) {
+    /* First instruction: every existing counter on this half is downstream of here. */
+    mk2_split_note_rx();
+
     struct peripheral_slot *slot = peripheral_slot_for_conn(conn);
 
     if (slot == NULL) {
         LOG_ERR("No peripheral state found for connection");
+        mk2_split_note_rx_no_slot();
         return BT_GATT_ITER_CONTINUE;
     }
 
     if (!data) {
         LOG_DBG("[UNSUBSCRIBED]");
+        mk2_split_note_rx_unsub();
         params->value_handle = 0U;
         return BT_GATT_ITER_STOP;
     }

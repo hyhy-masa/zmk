@@ -324,6 +324,91 @@ static void mk2_split_note_rx_unsub(void) {
 
 static void mk2_split_note_rx_no_slot(void) { split_rx_no_slot_count++; }
 
+/* System work queue latency probe.
+ *
+ * Everything measured so far only sees a stall when a key happens to be in flight: the split
+ * queue's wait is the gap between an event arriving and the consumer reaching it, so a stall
+ * while nobody is typing leaves no trace, and a stall during typing is confounded with how
+ * much was being typed. Thirty-six hours of measurement produced 26 samples that way.
+ *
+ * This submits one trivial item every 250 ms and records how long it waited before running.
+ * The consumer of key events (peripheral_event_work) sits on the same queue, so this delay is
+ * the delay those events would have seen - sampled four times a second whether or not anyone
+ * is at the keyboard.
+ *
+ * The timer deliberately does NOT resubmit while the previous item is still pending. Doing so
+ * would overwrite the submit timestamp every 250 ms and cap every measurement at one period,
+ * turning a seven second stall into a string of 250 ms ones - the instrument would report
+ * that nothing was wrong precisely when something was. */
+#define MK2_SYSWQ_PROBE_MS 250
+/* Below this the queue is keeping up; recording those would push the interesting entries out
+ * of the ring within seconds. */
+#define MK2_SYSWQ_STALL_MS 150
+#define MK2_SYSWQ_RING 8
+
+static uint32_t syswq_probe_submit_ms;
+static uint32_t syswq_probe_runs;
+static uint32_t syswq_probe_max_ms;
+static uint32_t syswq_probe_max_at_ms;
+static uint32_t syswq_stall_count;
+
+struct mk2_syswq_stall_rec {
+    uint32_t at_ms;
+    uint32_t delay_ms;
+};
+
+static struct mk2_syswq_stall_rec syswq_stall_ring[MK2_SYSWQ_RING];
+static uint32_t syswq_stall_next;
+
+static void mk2_syswq_probe_handler(struct k_work *work) {
+    uint32_t now = k_uptime_get_32();
+    uint32_t delay = now - syswq_probe_submit_ms;
+
+    syswq_probe_runs++;
+
+    if (delay > syswq_probe_max_ms) {
+        syswq_probe_max_ms = delay;
+        syswq_probe_max_at_ms = now;
+    }
+
+    if (delay < MK2_SYSWQ_STALL_MS) {
+        return;
+    }
+
+    /* Written here and read from the low priority dump, same as the other rings. */
+    unsigned int key = irq_lock();
+    struct mk2_syswq_stall_rec *rec = &syswq_stall_ring[syswq_stall_next % MK2_SYSWQ_RING];
+
+    rec->at_ms = now;
+    rec->delay_ms = delay;
+    syswq_stall_next++;
+    syswq_stall_count++;
+    irq_unlock(key);
+}
+
+static K_WORK_DEFINE(mk2_syswq_probe_work, mk2_syswq_probe_handler);
+
+static void mk2_syswq_probe_timer_fn(struct k_timer *timer) {
+    /* Runs in interrupt context; both calls below are allowed there. */
+    if (k_work_is_pending(&mk2_syswq_probe_work)) {
+        /* Still stuck from the last submit. Leaving the timestamp alone is the whole point -
+         * see the comment above. */
+        return;
+    }
+
+    syswq_probe_submit_ms = k_uptime_get_32();
+    k_work_submit(&mk2_syswq_probe_work);
+}
+
+static K_TIMER_DEFINE(mk2_syswq_probe_timer, mk2_syswq_probe_timer_fn, NULL);
+
+static int mk2_syswq_probe_init(void) {
+    k_timer_start(&mk2_syswq_probe_timer, K_MSEC(MK2_SYSWQ_PROBE_MS), K_MSEC(MK2_SYSWQ_PROBE_MS));
+    return 0;
+}
+
+SYS_INIT(mk2_syswq_probe_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
+
 /* atomic because the producers sit in different contexts - the BT RX path and the system
  * work queue both reach here. A plain ++ can lose an update, and a counter whose zero cannot
  * be trusted is the failure this whole exercise keeps circling back to. */
@@ -350,6 +435,22 @@ void mk2_split_pos_drop_dump(void) {
            (uint32_t)CONFIG_ZMK_SPLIT_BLE_CENTRAL_POSITION_QUEUE_SIZE, split_pos_max_wait_ms,
            split_pos_max_wait_at_ms, (uint32_t)MK2_SPLIT_WAIT_MIN_MS, split_pos_wait_next,
            k_uptime_get_32());
+
+    /* The probe measures the same queue the key consumer runs on, but four times a second
+     * regardless of typing - so a zero here means the queue really was keeping up, not that
+     * nobody happened to press a key while it was stuck. */
+    printk("[MK2_DIAG] syswq_runs=%u,max_ms=%u@%u,stall_ge%u=%u,since=boot,now_ms=%u\n",
+           syswq_probe_runs, syswq_probe_max_ms, syswq_probe_max_at_ms,
+           (uint32_t)MK2_SYSWQ_STALL_MS, syswq_stall_count, k_uptime_get_32());
+
+    uint32_t stalls = MIN(syswq_stall_next, (uint32_t)MK2_SYSWQ_RING);
+
+    for (uint32_t i = 0; i < stalls; i++) {
+        const struct mk2_syswq_stall_rec *rec =
+            &syswq_stall_ring[(syswq_stall_next - 1 - i) % MK2_SYSWQ_RING];
+
+        printk("[MK2_DIAG] syswq_stall[%u] %ums at=%u\n", i, rec->delay_ms, rec->at_ms);
+    }
 
     /* Printed next to the queue numbers on purpose: rx is what arrived, and everything else
      * on this line is what happened to it afterwards. Compare rx against the peripheral's
